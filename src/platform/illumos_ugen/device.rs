@@ -1,25 +1,32 @@
 use crate::{DeviceInfo, Error, Speed};
 
-use log::warn;
+use super::DevfsPath;
+use crate::bitset::EndpointBitSet;
+use crate::descriptors::{
+    parse_concatenated_config_descriptors, ConfigurationDescriptor, DeviceDescriptor,
+    EndpointDescriptor, TransferType,
+};
+use crate::maybe_future::{blocking::Blocking, MaybeFuture};
+use crate::platform::illumos_ugen::Errno;
+use crate::platform::TransferData;
+use crate::transfer::{
+    internal::{
+        notify_completion, take_completed_from_queue, Idle, Notify, Pending, TransferFuture,
+    },
+    Buffer, Completion, ControlIn, ControlOut, ControlType, Direction, Recipient, TransferError,
+};
+use crate::ErrorKind;
+use log::debug;
+use rustix::fd::AsFd;
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::io;
-use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::time::Duration;
-
-use crate::descriptors::{
-    parse_concatenated_config_descriptors, validate_config_descriptor, Configuration,
-    DeviceDescriptor,
-};
-use crate::transfer::{
-    Control, ControlIn, ControlType, Direction, EndpointType, Recipient, TransferError,
-    TransferHandle,
-};
-
-use super::DevfsPath;
 
 //
 // Useful USB constants. We use names that deliberately match those found in
@@ -33,9 +40,13 @@ const USB_EP_DIR_MASK: u8 = 0x80;
 
 enum DescriptorType {
     Device,
-    Configuration { index: u8 },
+    Configuration {
+        index: u8,
+    },
     #[allow(dead_code)]
-    String { index: u8 },
+    String {
+        index: u8,
+    },
 }
 
 impl DescriptorType {
@@ -56,16 +67,127 @@ impl DescriptorType {
     }
 }
 
-#[derive(Debug)]
-struct Endpoint {
+pub(crate) struct IllumosEndpoint {
+    inner: Arc<EndpointInner>,
+
+    pub(crate) max_packet_size: usize,
+
+    /// A queue of pending transfers, expected to complete in order
+    pending: VecDeque<Pending<super::TransferData>>,
+
+    idle_transfer: Option<Idle<TransferData>>,
+}
+
+impl IllumosEndpoint {
+    pub(crate) fn endpoint_address(&self) -> u8 {
+        self.inner.raw.address
+    }
+
+    pub(crate) fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn cancel_all(&mut self) {
+        // Cancel transfers in reverse order to ensure subsequent transfers
+        // can't complete out of order while we're going through them.
+        //for transfer in self.pending.iter_mut().rev() {
+        //    self.inner.interface.cancel(transfer);
+        //}
+    }
+
+    fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
+        let mut transfer = self.idle_transfer.take().unwrap_or_else(|| {
+            Idle::new(
+                self.inner.clone(),
+                super::TransferData::new(self.inner.raw.address),
+            )
+        });
+
+        transfer.set_buffer(buffer);
+        transfer
+    }
+
+    pub(crate) fn submit_err(&mut self, buffer: Buffer, _error: TransferError) {
+        let t = self.make_transfer(buffer);
+        // XXX UGHGH
+        //t.status = Some(Err(error));
+        self.pending.push_back(t.simulate_complete());
+    }
+
+    pub(crate) fn submit(&mut self, buffer: Buffer) {
+        let t = self.make_transfer(buffer);
+        let t = self.inner.interface.submit(&self.inner.fd, t);
+        self.pending.push_back(t);
+    }
+
+    pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
+        self.inner.notify.subscribe(cx);
+        if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
+            let completion = transfer.take_completion();
+            self.idle_transfer = Some(transfer);
+            Poll::Ready(completion)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
+        self.inner.notify.wait_timeout(timeout, || {
+            take_completed_from_queue(&mut self.pending).map(|mut transfer| {
+                let completion = transfer.take_completion();
+                self.idle_transfer = Some(transfer);
+                completion
+            })
+        })
+    }
+
+    pub(crate) fn clear_halt(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        let inner = self.inner.clone();
+        Blocking::new(move || {
+            let endpoint = inner.raw.address;
+            debug!("Clear halt, endpoint {endpoint:02x}");
+            todo!();
+        })
+    }
+}
+
+impl Drop for IllumosEndpoint {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            debug!(
+                "Dropping endpoint {:02x} with {} pending transfers",
+                self.inner.raw.address,
+                self.pending.len()
+            );
+            self.cancel_all();
+        }
+    }
+}
+
+//#[derive(Debug)]
+struct EndpointInner {
+    raw: RawEndpoint,
+    notify: Notify,
+    interface: Arc<IllumosInterface>,
+    fd: Arc<OwnedFd>,
+}
+
+impl AsRef<Notify> for EndpointInner {
+    fn as_ref(&self) -> &Notify {
+        &self.notify
+    }
+}
+
+#[derive(Clone)]
+struct RawEndpoint {
     interface_number: u8,
     address: u8,
     #[allow(dead_code)]
-    transfer_type: EndpointType,
+    transfer_type: TransferType,
     direction: Direction,
 }
 
-impl Endpoint {
+impl RawEndpoint {
     fn device_basename(&self) -> String {
         format!(
             "if{}{}{}",
@@ -87,7 +209,7 @@ impl Endpoint {
     }
 }
 
-#[derive(Debug)]
+//#[derive(Debug)]
 pub(crate) struct IllumosDevice {
     #[allow(dead_code)]
     fd: OwnedFd,
@@ -95,7 +217,7 @@ pub(crate) struct IllumosDevice {
     config_descriptors: Vec<u8>,
     active_config: u8,
     paths: DevfsPath,
-    interfaces: HashMap<u8, Vec<Endpoint>>,
+    interfaces: HashMap<u8, Vec<RawEndpoint>>,
 }
 
 fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u8>, Error> {
@@ -111,18 +233,18 @@ fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u
         length: USB_CFG_DESCR_SIZE,
     };
 
-    io::write(fd, control.setup_packet().as_slice())?;
+    io::write(fd, control.setup_packet().as_slice()).unwrap();
 
     let mut buf = [0u8; USB_CFG_DESCR_SIZE as usize];
-    io::read(fd, &mut buf)?;
+    io::read(fd, &mut buf).unwrap();
 
     let total = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as u16;
     control.length = total;
 
-    io::write(fd, control.setup_packet().as_slice())?;
+    io::write(fd, control.setup_packet().as_slice()).unwrap();
 
     let mut descriptors = vec![0u8; total as usize];
-    io::read(fd, &mut descriptors)?;
+    io::read(fd, &mut descriptors).unwrap();
 
     Ok(descriptors)
 }
@@ -139,82 +261,120 @@ fn get_configuration(fd: &OwnedFd) -> Result<u8, Error> {
 
     let mut buf = [0u8];
 
-    io::write(fd, control.setup_packet().as_slice())?;
-    io::read(fd, &mut buf)?;
+    // XXX
+    io::write(fd, control.setup_packet().as_slice()).unwrap();
+    io::read(fd, &mut buf).unwrap();
 
     Ok(buf[0])
 }
 
 impl IllumosDevice {
-    pub(crate) fn from_device_info(d: &DeviceInfo) -> Result<Arc<IllumosDevice>, Error> {
+    pub(crate) fn from_device_info(
+        d: &DeviceInfo,
+    ) -> impl MaybeFuture<Output = Result<Arc<IllumosDevice>, Error>> {
         //
         // We are going to open our control FD, and ask for descriptor
         // information.  (We expect this information to match that that's
         // already in the devinfo tree as the `usb-raw-cfg-descriptors`
         // property, but we don't cache that in `DeviceInfo`.)
         //
-        let path = Path::new(d.path.device_paths.get("cntrl0").unwrap());
+        let dpath = d.path.clone();
 
-        let fd = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
-            .inspect_err(|e| warn!("Failed to open device {path:?}: {e}"))?;
+        Blocking::new(move || {
+            let path = Path::new(
+                dpath
+                    .device_paths
+                    .get("cntrl0")
+                    .ok_or(Error::new(ErrorKind::Other, "not ugen"))?,
+            );
 
-        let device_descriptor = get_descriptor(&fd, DescriptorType::Device)?;
-        let active_config = get_configuration(&fd)?;
+            let fd = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| {
+                    match e {
+                        Errno::NOENT => {
+                            Error::new_os(ErrorKind::Disconnected, "device not found", e)
+                        }
+                        Errno::PERM => {
+                            Error::new_os(ErrorKind::PermissionDenied, "permission denied", e)
+                        }
+                        e => Error::new_os(ErrorKind::Other, "failed to open device", e),
+                    }
+                    .log_debug()
+                })?;
 
-        #[rustfmt::skip]
-        let config_descriptors = get_descriptor(
-            &fd, DescriptorType::Configuration { index: 0 }
-        )?;
+            let device_descriptor = get_descriptor(&fd, DescriptorType::Device)?;
+            let active_config = get_configuration(&fd)?;
 
-        let Some(_) = validate_config_descriptor(&config_descriptors) else {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "invalid device descriptor",
-            ));
-        };
+            #[rustfmt::skip]
+            let config_descriptors = get_descriptor(
+                &fd, DescriptorType::Configuration { index: 0 }
+            )?;
 
-        let c = Configuration::new(&config_descriptors);
+            let c = ConfigurationDescriptor::new(&config_descriptors).unwrap();
 
-        let interfaces = c
-            .interfaces()
-            .map(|i| {
-                let alt = i.first_alt_setting();
-                let interface_number = alt.interface_number();
+            let interfaces = c
+                .interfaces()
+                .map(|i| {
+                    let alt = i.first_alt_setting();
+                    let interface_number = alt.interface_number();
 
-                (
-                    interface_number,
-                    alt.endpoints()
-                        .map(|ep| Endpoint {
-                            interface_number,
-                            address: ep.address(),
-                            direction: ep.direction(),
-                            transfer_type: ep.transfer_type(),
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+                    (
+                        interface_number,
+                        alt.endpoints()
+                            .map(|ep| RawEndpoint {
+                                interface_number,
+                                address: ep.address(),
+                                direction: ep.direction(),
+                                transfer_type: ep.transfer_type(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
 
-        Ok(Arc::new(Self {
-            fd,
-            device_descriptor,
-            config_descriptors,
-            active_config,
-            paths: d.path.clone(),
-            interfaces: interfaces,
-        }))
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn handle_events(&self) {
-        todo!();
+            Ok(Arc::new(Self {
+                fd,
+                device_descriptor,
+                config_descriptors,
+                active_config,
+                paths: dpath.clone(),
+                interfaces: interfaces,
+            }))
+        })
     }
 
     pub(crate) fn device_descriptor(&self) -> DeviceDescriptor {
-        DeviceDescriptor::new(&self.device_descriptor)
+        DeviceDescriptor::new(&self.device_descriptor).unwrap()
     }
 
-    pub(crate) fn configuration_descriptors(&self) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn control_in(
+        self: Arc<Self>,
+        data: ControlIn,
+        _timeout: Duration,
+    ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
+        let (t, _) = TransferData::new_control_in(data);
+        TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
+            drop(self);
+            t.status()?;
+            Ok(t.control_in_data().to_owned())
+        })
+    }
+
+    pub(crate) fn control_out(
+        self: Arc<Self>,
+        data: ControlOut,
+        _timeout: Duration,
+    ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
+        let (t, _) = TransferData::new_control_out(data);
+        TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
+            drop(self);
+            t.status()
+        })
+    }
+
+    pub(crate) fn configuration_descriptors(
+        &self,
+    ) -> impl Iterator<Item = ConfigurationDescriptor<'_>> {
         parse_concatenated_config_descriptors(&self.config_descriptors)
     }
 
@@ -223,72 +383,71 @@ impl IllumosDevice {
     }
 
     #[allow(unused)]
-    pub(crate) fn set_configuration(&self, configuration: u8) -> Result<(), Error> {
-        todo!();
-    }
-
-    pub(crate) fn reset(&self) -> Result<(), Error> {
-        todo!();
-    }
-
-    #[allow(unused)]
-    pub fn control_in_blocking(
+    pub(crate) fn set_configuration(
         &self,
-        control: Control,
-        data: &mut [u8],
-        timeout: Duration,
-    ) -> Result<usize, TransferError> {
-        todo!();
+        configuration: u8,
+    ) -> impl MaybeFuture<Output = Result<(), Error>> {
+        Blocking::new(move || todo!())
     }
 
-    #[allow(unused)]
-    pub fn control_out_blocking(
-        &self,
-        control: Control,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<usize, TransferError> {
-        _ = control.request_type(Direction::In);
-        todo!();
+    pub(crate) fn reset(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        Blocking::new(move || todo!())
     }
 
     pub(crate) fn claim_interface(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         interface_number: u8,
-    ) -> Result<Arc<IllumosInterface>, Error> {
-        let Some(eps) = self.interfaces.get(&interface_number) else {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "invalid interface number",
-            ));
-        };
-
-        let mut fds = HashMap::new();
-
-        for ep in eps {
-            let devname = ep.device_basename();
-
-            let Some(path) = self.paths.device_paths.get(&devname) else {
-                return Err(Error::new(ErrorKind::InvalidData, "bad device"));
+    ) -> impl MaybeFuture<Output = Result<Arc<IllumosInterface>, Error>> {
+        Blocking::new(move || {
+            let Some(eps) = self.interfaces.get(&interface_number) else {
+                return Err(Error::new(ErrorKind::Other, "invalid interface number"));
             };
 
-            let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty())?;
-            fds.insert(ep.address, Arc::new(fd));
-        }
+            let mut fds = HashMap::new();
 
-        Ok(Arc::new(IllumosInterface {
-            interface_number,
-            fds,
-            device: self.clone(),
-        }))
+            for ep in eps {
+                let devname = ep.device_basename();
+
+                let Some(path) = self.paths.device_paths.get(&devname) else {
+                    return Err(Error::new(ErrorKind::Other, "bad device"));
+                };
+
+                // XXX
+                let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).unwrap();
+                fds.insert(ep.address, Arc::new(fd));
+            }
+
+            Ok(Arc::new(IllumosInterface {
+                interface_number,
+                fds,
+                device: self.clone(),
+                state: Mutex::new(InterfaceState::default()),
+            }))
+        })
+    }
+
+    pub(crate) fn submit(&self, transfer: Idle<TransferData>) -> Pending<TransferData> {
+        let ep = transfer.endpoint;
+        let dir = Direction::from_address(ep);
+        //let len = transfer.request_len;
+        let pending = transfer.pre_submit();
+
+        pending.transfer(&self.fd, dir);
+
+        unsafe {
+            notify_completion::<TransferData>(pending.as_ptr());
+        }
+        pending
     }
 
     #[allow(unused)]
     pub(crate) fn detach_and_claim_interface(
         self: &Arc<Self>,
         interface_number: u8,
-    ) -> Result<Arc<IllumosInterface>, Error> {
-        todo!();
+    ) -> impl MaybeFuture<Output = Result<Arc<IllumosInterface>, Error>> {
+        // We may eventually want to do something here to detach but this
+        // is okay for now
+        self.clone().claim_interface(interface_number)
     }
 
     pub(crate) fn speed(&self) -> Option<Speed> {
@@ -296,55 +455,121 @@ impl IllumosDevice {
     }
 }
 
-#[derive(Debug)]
+#[derive(Default)]
+struct InterfaceState {
+    alt_setting: u8,
+    endpoints: EndpointBitSet,
+}
+
+unsafe impl Sync for IllumosInterface {}
+
+//#[derive(Debug)]
 pub(crate) struct IllumosInterface {
     pub(crate) interface_number: u8,
     pub(crate) device: Arc<IllumosDevice>,
     pub(crate) fds: HashMap<u8, Arc<OwnedFd>>,
+    state: Mutex<InterfaceState>,
 }
 
 impl IllumosInterface {
-    pub(crate) fn make_transfer(
+    pub fn control_in(
+        &self,
+        data: ControlIn,
+        _timeout: Duration,
+    ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
+        let (t, endpoint) = TransferData::new_control_in(data);
+        TransferFuture::new(t, |t| {
+            // XXX erorr handling?
+            self.submit(self.fds.get(&endpoint).unwrap().clone(), t)
+        })
+        .map(move |mut t| {
+            let c = t.take_completion();
+            c.status?;
+            Ok(c.buffer.into_vec())
+        })
+    }
+
+    pub fn control_out(
+        self: Arc<Self>,
+        data: ControlOut,
+        _timeout: Duration,
+    ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
+        let (t, endpoint) = TransferData::new_control_out(data);
+        // XXX error handling
+        TransferFuture::new(t, |t| {
+            self.submit(self.fds.get(&endpoint).unwrap().clone(), t)
+        })
+        .map(move |mut t| {
+            let c = t.take_completion();
+            c.status
+        })
+    }
+
+    pub fn set_alt_setting(
+        self: Arc<Self>,
+        _alt_setting: u8,
+    ) -> impl MaybeFuture<Output = Result<(), Error>> {
+        // doesn't work exactly the same here
+        Blocking::new(move || todo!("Not implemented"))
+    }
+
+    pub fn get_alt_setting(&self) -> u8 {
+        self.state.lock().unwrap().alt_setting
+    }
+
+    pub fn endpoint(
         self: &Arc<Self>,
-        endpoint: u8,
-        ep_type: EndpointType,
-    ) -> TransferHandle<super::TransferData> {
-        TransferHandle::new(super::TransferData::new(
-            self.device.clone(),
-            Some(self.clone()),
-            endpoint,
-            ep_type,
-        ))
+        descriptor: EndpointDescriptor,
+    ) -> Result<IllumosEndpoint, Error> {
+        let address = descriptor.address();
+        let ep_type = descriptor.transfer_type();
+        let max_packet_size = descriptor.max_packet_size();
+
+        let mut state = self.state.lock().unwrap();
+
+        if state.endpoints.is_set(address) {
+            return Err(Error::new(ErrorKind::Busy, "endpoint already in use"));
+        }
+        // hhn error types hard
+        let raw = self
+            .device
+            .interfaces
+            .get(&self.interface_number)
+            .unwrap()
+            .iter()
+            .find(|x| x.address == address && x.transfer_type == ep_type)
+            .unwrap();
+
+        state.endpoints.set(address);
+        Ok(IllumosEndpoint {
+            inner: Arc::new(EndpointInner {
+                raw: raw.clone(),
+                interface: self.clone(),
+                fd: self.fds.get(&address).unwrap().clone(),
+                notify: Notify::new(),
+            }),
+            max_packet_size,
+
+            pending: VecDeque::new(),
+            idle_transfer: None,
+        })
     }
 
-    #[allow(unused)]
-    pub fn control_in_blocking(
+    pub(crate) fn submit(
         &self,
-        control: Control,
-        data: &mut [u8],
-        timeout: Duration,
-    ) -> Result<usize, TransferError> {
-        todo!();
-    }
+        fd: impl AsFd,
+        transfer: Idle<TransferData>,
+    ) -> Pending<TransferData> {
+        let ep = transfer.endpoint;
+        let dir = Direction::from_address(ep);
+        let pending = transfer.pre_submit();
 
-    #[allow(unused)]
-    pub fn control_out_blocking(
-        &self,
-        control: Control,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<usize, TransferError> {
-        todo!();
-    }
+        pending.transfer(fd, dir);
 
-    #[allow(unused)]
-    pub fn set_alt_setting(&self, alt_setting: u8) -> Result<(), Error> {
-        todo!();
-    }
-
-    #[allow(unused)]
-    pub fn clear_halt(&self, endpoint: u8) -> Result<(), Error> {
-        todo!();
+        unsafe {
+            notify_completion::<TransferData>(pending.as_ptr());
+        }
+        pending
     }
 }
 

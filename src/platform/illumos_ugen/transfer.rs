@@ -1,65 +1,92 @@
+use crate::platform::illumos_ugen::errno_to_transfer_error;
+use crate::transfer::internal::Pending;
+use crate::transfer::{
+    Buffer, Completion, ControlIn, ControlOut, Direction, TransferError, SETUP_PACKET_SIZE,
+};
 use rustix::fd::AsFd;
-use rustix::fd::OwnedFd;
 use rustix::io;
 use rustix::io::Errno;
-use std::ffi::c_void;
-use std::sync::Arc;
-
-use super::errno_to_transfer_error;
-
-use crate::transfer::{
-    notify_completion, Completion, ControlIn, ControlOut, EndpointType, PlatformSubmit,
-    PlatformTransfer, RequestBuffer, ResponseBuffer
-};
+use std::mem;
+use std::mem::ManuallyDrop;
 
 #[allow(dead_code)]
 pub struct TransferData {
-    interface: Arc<super::Interface>,
-    endpoint: u8,
-    device: Arc<super::Device>,
-    fd: Arc<OwnedFd>,
-    status: Option<Result<usize, Errno>>,
-    data: Option<Vec<u8>>,
+    pub(crate) buf: *mut u8,
+    pub(crate) endpoint: u8,
+    pub(crate) status: Option<Result<usize, Errno>>,
+    pub(crate) request_len: u32,
+    capacity: u32,
+    initialized_len: u32,
 }
 
 unsafe impl Send for TransferData {}
+unsafe impl Sync for TransferData {}
 
 impl TransferData {
-    pub(super) fn new(
-        device: Arc<super::Device>,
-        interface: Option<Arc<super::Interface>>,
-        endpoint: u8,
-        _ep_type: EndpointType,
-    ) -> TransferData {
-        let binding = interface.unwrap();
-        let fd = binding.fds.get(&endpoint).unwrap().clone();
+    pub(super) fn new(endpoint: u8) -> TransferData {
+        let mut empty = ManuallyDrop::new(Vec::with_capacity(0));
 
         TransferData {
-            interface: binding,
+            buf: empty.as_mut_ptr(),
+            request_len: 0,
             endpoint,
-            device: device.clone(),
-            fd,
             status: None,
-            data: None,
+            capacity: 0,
+            initialized_len: 0,
         }
     }
-}
 
-impl Drop for TransferData {
-    fn drop(&mut self) {}
-}
+    pub(super) fn new_control_out(data: ControlOut) -> (TransferData, u8) {
+        const OUT_EP: u8 = 0x00;
 
-impl PlatformTransfer for TransferData {
-    fn cancel(&self) {}
-}
-
-impl PlatformSubmit<Vec<u8>> for TransferData {
-    unsafe fn submit(&mut self, data: Vec<u8>, user_data: *mut c_void) {
-        self.status = Some(io::write(self.fd.as_ref().as_fd(), &data));
-        notify_completion::<super::TransferData>(user_data);
+        let mut t = TransferData::new(OUT_EP);
+        let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.data.len()).unwrap());
+        buffer.extend_from_slice(&data.setup_packet());
+        buffer.extend_from_slice(data.data);
+        t.set_buffer(buffer);
+        (t, OUT_EP)
     }
 
-    unsafe fn take_completed(&mut self) -> Completion<ResponseBuffer> {
+    pub(super) fn new_control_in(data: ControlIn) -> (TransferData, u8) {
+        const IN_EP: u8 = 0x80;
+
+        let mut t = TransferData::new(IN_EP);
+        let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.length as usize).unwrap());
+        buffer.extend_from_slice(&data.setup_packet());
+        t.set_buffer(buffer);
+        (t, IN_EP)
+    }
+
+    pub(super) fn set_buffer(&mut self, buf: Buffer) {
+        debug_assert!(self.capacity == 0);
+        let buf = ManuallyDrop::new(buf);
+        self.capacity = buf.capacity;
+        self.buf = buf.ptr;
+        self.request_len = match Direction::from_address(self.endpoint) {
+            Direction::Out => buf.len,
+            Direction::In => buf.requested_len,
+        };
+        self.initialized_len = buf.len;
+    }
+
+    pub fn control_in_data(&self) -> &[u8] {
+        let Ok(len) = self.status.unwrap() else {
+            panic!("argh argh");
+        };
+        unsafe { std::slice::from_raw_parts(self.buf.add(SETUP_PACKET_SIZE), len as usize) }
+    }
+
+    pub fn status(&self) -> Result<(), TransferError> {
+        match self.status {
+            // XXX
+            None => Ok(()),
+            Some(Ok(_)) => Ok(()),
+            // XXX
+            Some(Err(_)) => Err(TransferError::Fault),
+        }
+    }
+
+    pub fn take_completion(&mut self) -> Completion {
         let (len, status) = match self.status.unwrap() {
             Ok(len) => (len, Ok(())),
             Err(err) => (0, Err(errno_to_transfer_error(err))),
@@ -67,55 +94,74 @@ impl PlatformSubmit<Vec<u8>> for TransferData {
 
         self.status = None;
 
+        println!("our len was {}", len);
+        let mut empty = ManuallyDrop::new(Vec::new());
+        let ptr = mem::replace(&mut self.buf, empty.as_mut_ptr());
+        let capacity = mem::replace(&mut self.capacity, 0);
+        let len = match Direction::from_address(self.endpoint) {
+            Direction::Out => self.request_len,
+            Direction::In => len as u32,
+        };
+        let requested_len = mem::replace(&mut self.request_len, 0);
+
         Completion {
-            data: ResponseBuffer::from_vec(vec![], len),
-            status: status,
+            status,
+            actual_len: len as usize,
+            buffer: Buffer {
+                ptr,
+                len,
+                requested_len,
+                capacity,
+                allocator: crate::transfer::Allocator::Default,
+            },
         }
     }
 }
 
-impl PlatformSubmit<RequestBuffer> for TransferData {
-    unsafe fn submit(&mut self, data: RequestBuffer, user_data: *mut c_void) {
-        let (mut data, _len) = data.into_vec();
-        data.resize(data.capacity(), 0);
+impl Pending<TransferData> {
+    pub(super) fn transfer(&self, fd: impl AsFd, dir: Direction) {
+        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
 
-        self.status = Some(io::read(self.fd.as_ref().as_fd(), &mut data));
-        self.data = Some(data);
-
-        notify_completion::<super::TransferData>(user_data);
-    }
-
-    unsafe fn take_completed(&mut self) -> Completion<Vec<u8>> {
-        let (len, status) = match self.status.unwrap() {
-            Ok(len) => (len, Ok(())),
-            Err(err) => (0, Err(errno_to_transfer_error(err))),
+        // Rustix wants to work on the full buffer which is not what nusb expects
+        let buf = unsafe {
+            std::slice::from_raw_parts(
+                (*self.as_ptr()).buf,
+                (*self.as_ptr()).initialized_len as usize,
+            )
         };
 
-        Completion {
-            data: self.data.take().unwrap()[0..len].to_vec(),
-            status,
+        //println!("writing {:x?}", buf);
+        let status = io::write(&fd, buf);
+        unsafe {
+            (*alias).status = Some(status);
+        }
+
+        if status.is_ok() {
+            match dir {
+                Direction::In => {
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (*self.as_ptr()).buf.add(SETUP_PACKET_SIZE),
+                            (*self.as_ptr()).request_len as usize,
+                        )
+                    };
+                    unsafe {
+                        (*alias).status = Some(io::read(&fd, buf));
+                    }
+                    //println!("read {:x?}", buf);
+                }
+                // Nothing else to do with out
+                Direction::Out => {}
+            }
         }
     }
 }
 
-impl PlatformSubmit<ControlIn> for TransferData {
-    #[allow(unused)]
-    unsafe fn submit(&mut self, data: ControlIn, user_data: *mut c_void) {
-        todo!();
-    }
-
-    unsafe fn take_completed(&mut self) -> Completion<Vec<u8>> {
-        todo!();
+impl Drop for TransferData {
+    fn drop(&mut self) {
+        //unsafe {
+        //    drop(Vec::from_raw_parts(self.buf, 0, self.capacity as usize));
+        //}
     }
 }
 
-impl PlatformSubmit<ControlOut<'_>> for TransferData {
-    #[allow(unused)]
-    unsafe fn submit(&mut self, data: ControlOut, user_data: *mut c_void) {
-        todo!();
-    }
-
-    unsafe fn take_completed(&mut self) -> Completion<ResponseBuffer> {
-        todo!();
-    }
-}
