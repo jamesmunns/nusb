@@ -94,7 +94,6 @@ impl TransferData {
 
         self.status = None;
 
-        println!("our len was {}", len);
         let mut empty = ManuallyDrop::new(Vec::new());
         let ptr = mem::replace(&mut self.buf, empty.as_mut_ptr());
         let capacity = mem::replace(&mut self.capacity, 0);
@@ -119,7 +118,33 @@ impl TransferData {
 }
 
 impl Pending<TransferData> {
-    pub(super) fn transfer(&self, fd: impl AsFd, dir: Direction) {
+    pub(super) fn ep_transfer(&self, fd: impl AsFd, dir: Direction) {
+        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+
+        let check_len = unsafe { (*self.as_ptr()).initialized_len };
+
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(
+                (*self.as_ptr()).buf,
+                (*self.as_ptr()).request_len as usize,
+            )
+        };
+
+        match dir {
+            Direction::In => {
+                unsafe {
+                    (*alias).status = Some(io::read(&fd, buf));
+                }
+            }
+            Direction::Out => {
+                unsafe {
+                    (*alias).status = Some(io::write(&fd, buf));
+                }
+            }
+        }
+    }
+
+    pub(super) fn control_transfer(&self, fd: impl AsFd, dir: Direction) {
         let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
 
         // Rustix wants to work on the full buffer which is not what nusb expects
@@ -130,7 +155,6 @@ impl Pending<TransferData> {
             )
         };
 
-        //println!("writing {:x?}", buf);
         let status = io::write(&fd, buf);
         unsafe {
             (*alias).status = Some(status);
@@ -148,7 +172,8 @@ impl Pending<TransferData> {
                     unsafe {
                         (*alias).status = Some(io::read(&fd, buf));
                     }
-                    //println!("read {:x?}", buf);
+                        (*alias).status
+                    });
                 }
                 // Nothing else to do with out
                 Direction::Out => {}
@@ -164,4 +189,3 @@ impl Drop for TransferData {
         //}
     }
 }
-

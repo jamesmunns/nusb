@@ -1,9 +1,12 @@
-use crate::descriptors::{ConfigurationDescriptor, DeviceDescriptor};
+use crate::descriptors::{decode_string_descriptor, ConfigurationDescriptor, DeviceDescriptor};
 use crate::maybe_future::Ready;
+use crate::platform::illumos_ugen::device::get_raw_string;
 use crate::ErrorKind;
 use crate::MaybeFuture;
 use crate::{BusInfo, DeviceInfo, Error, InterfaceInfo, UsbControllerType};
+use rustix::fs::{Mode, OFlags};
 use std::collections::HashMap;
+use std::num::NonZeroU8;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -70,6 +73,22 @@ fn walk_buses() -> Result<impl Iterator<Item = BusInfo>, Error> {
         }
     }
     Ok(buses.into_iter())
+}
+
+fn try_get_interface_string(path: Option<&String>, index: Option<NonZeroU8>) -> Option<String> {
+    let Some(path) = path else {
+        return None;
+    };
+
+    let Some(index) = index else {
+        return None;
+    };
+
+    let fd = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).unwrap();
+
+    let result = get_raw_string(&fd, index.into()).unwrap();
+
+    decode_string_descriptor(&result).ok()
 }
 
 fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
@@ -173,34 +192,7 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
             };
 
             if let Some(d) = DeviceDescriptor::new(b) {
-                let interfaces = match props.get("usb-raw-cfg-descriptors") {
-                    Some(PropVal::Bytes(cfg)) => {
-                        let c = ConfigurationDescriptor::new(cfg).unwrap();
-
-                        c.interfaces()
-                            .map(|i| {
-                                let alt = i.first_alt_setting();
-
-                                //
-                                // If we want to pull the interface string,
-                                // we'll need to open the configuration
-                                // endpoint and pull the String descriptors.
-                                //
-                                InterfaceInfo {
-                                    interface_number: i.interface_number(),
-                                    class: alt.class(),
-                                    subclass: alt.subclass(),
-                                    protocol: alt.protocol(),
-                                    interface_string: None,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    }
-                    _ => return Err(Error::new(ErrorKind::Other, "bad raw config decriptors")),
-                };
-
                 let mut paths: HashMap<String, String> = HashMap::new();
-
                 let mut wm = n.minors();
                 while let Some(m) = wm
                     .next()
@@ -229,6 +221,37 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
                         );
                     }
                 }
+
+                let cntrl = paths.get("cntrl0");
+
+                let interfaces = match props.get("usb-raw-cfg-descriptors") {
+                    Some(PropVal::Bytes(cfg)) => {
+                        let c = ConfigurationDescriptor::new(cfg).unwrap();
+
+                        c.interfaces()
+                            .map(|i| {
+                                let alt = i.first_alt_setting();
+
+                                //
+                                // If we want to pull the interface string,
+                                // we'll need to open the configuration
+                                // endpoint and pull the String descriptors.
+                                //
+                                InterfaceInfo {
+                                    interface_number: i.interface_number(),
+                                    class: alt.class(),
+                                    subclass: alt.subclass(),
+                                    protocol: alt.protocol(),
+                                    interface_string: try_get_interface_string(
+                                        cntrl,
+                                        alt.string_index(),
+                                    ),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                    _ => return Err(Error::new(ErrorKind::Other, "bad raw config decriptors")),
+                };
 
                 devices.push(DeviceInfo {
                     path: DevfsPath {

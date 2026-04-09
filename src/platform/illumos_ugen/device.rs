@@ -115,9 +115,21 @@ impl IllumosEndpoint {
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
+        //println!(">>> submitting {}", buffer.len());
         let t = self.make_transfer(buffer);
-        let t = self.inner.interface.submit(&self.inner.fd, t);
-        self.pending.push_back(t);
+        //let t = self.inner.interface.submit(&self.inner.fd, t);
+        let ep = t.endpoint;
+        let dir = Direction::from_address(ep);
+        //let len = transfer.request_len;
+        let pending = t.pre_submit();
+
+        pending.ep_transfer(&self.inner.fd, dir);
+
+        unsafe {
+            notify_completion::<TransferData>(pending.as_ptr());
+        }
+
+        self.pending.push_back(pending);
     }
 
     pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
@@ -172,6 +184,14 @@ struct EndpointInner {
     fd: Arc<OwnedFd>,
 }
 
+impl Drop for EndpointInner {
+    fn drop(&mut self) {
+        //println!("dropping {:?}", self.fd);
+        let mut state = self.interface.state.lock().unwrap();
+        state.endpoints.clear(self.raw.address);
+    }
+}
+
 impl AsRef<Notify> for EndpointInner {
     fn as_ref(&self) -> &Notify {
         &self.notify
@@ -220,7 +240,28 @@ pub(crate) struct IllumosDevice {
     interfaces: HashMap<u8, Vec<RawEndpoint>>,
 }
 
+pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> {
+    let mut result = get_raw(
+        fd,
+        DescriptorType::String { index },
+        crate::descriptors::language_id::US_ENGLISH,
+        4096,
+    )?;
+
+    result.truncate(result[0].into());
+    Ok(result)
+}
+
 fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u8>, Error> {
+    get_raw(fd, descriptor_type, 0, USB_CFG_DESCR_SIZE)
+}
+
+fn get_raw(
+    fd: &OwnedFd,
+    descriptor_type: DescriptorType,
+    index: u16,
+    length: u16,
+) -> Result<Vec<u8>, Error> {
     #[allow(non_snake_case)]
     let wValue: u16 = descriptor_type.to_value();
 
@@ -229,7 +270,7 @@ fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u
         recipient: Recipient::Device,
         request: USB_REQ_GET_DESCR,
         value: wValue,
-        index: 0,
+        index,
         length: USB_CFG_DESCR_SIZE,
     };
 
@@ -240,6 +281,7 @@ fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u
 
     let total = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as u16;
     control.length = total;
+    control.index = index;
 
     io::write(fd, control.setup_packet().as_slice()).unwrap();
 
@@ -307,7 +349,7 @@ impl IllumosDevice {
 
             #[rustfmt::skip]
             let config_descriptors = get_descriptor(
-                &fd, DescriptorType::Configuration { index: 0 }
+                &fd, DescriptorType::Configuration { index: 0 },
             )?;
 
             let c = ConfigurationDescriptor::new(&config_descriptors).unwrap();
@@ -414,6 +456,7 @@ impl IllumosDevice {
 
                 // XXX
                 let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).unwrap();
+                //println!(">>> {} {:x} {:?}", path, ep.address, fd);
                 fds.insert(ep.address, Arc::new(fd));
             }
 
@@ -432,7 +475,7 @@ impl IllumosDevice {
         //let len = transfer.request_len;
         let pending = transfer.pre_submit();
 
-        pending.transfer(&self.fd, dir);
+        pending.control_transfer(&self.fd, dir);
 
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
@@ -541,11 +584,13 @@ impl IllumosInterface {
             .unwrap();
 
         state.endpoints.set(address);
+        let fd = self.fds.get(&address).unwrap().clone();
+        //println!("check here {:x} {fd:?} max {}", address, max_packet_size);
         Ok(IllumosEndpoint {
             inner: Arc::new(EndpointInner {
                 raw: raw.clone(),
                 interface: self.clone(),
-                fd: self.fds.get(&address).unwrap().clone(),
+                fd,
                 notify: Notify::new(),
             }),
             max_packet_size,
@@ -555,16 +600,12 @@ impl IllumosInterface {
         })
     }
 
-    pub(crate) fn submit(
-        &self,
-        fd: impl AsFd,
-        transfer: Idle<TransferData>,
-    ) -> Pending<TransferData> {
+    pub fn submit(&self, fd: impl AsFd, transfer: Idle<TransferData>) -> Pending<TransferData> {
         let ep = transfer.endpoint;
         let dir = Direction::from_address(ep);
         let pending = transfer.pre_submit();
 
-        pending.transfer(fd, dir);
+        pending.control_transfer(fd, dir);
 
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
