@@ -313,7 +313,7 @@ impl Device {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
-        target_os = "illumos"
+        //target_os = "illumos"
     ))]
     pub fn control_in(
         &self,
@@ -355,7 +355,7 @@ impl Device {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
-        target_os = "illumos"
+        //target_os = "illumos"
     ))]
     pub fn control_out(
         &self,

@@ -394,7 +394,7 @@ impl IllumosDevice {
         data: ControlIn,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let (t, _) = TransferData::new_control_in(data);
+        let t = TransferData::new_control_in(data);
         TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
             drop(self);
             t.status()?;
@@ -407,7 +407,7 @@ impl IllumosDevice {
         data: ControlOut,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let (t, _) = TransferData::new_control_out(data);
+        let t = TransferData::new_control_out(data);
         TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
             drop(self);
             t.status()
