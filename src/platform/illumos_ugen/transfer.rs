@@ -131,16 +131,12 @@ impl Pending<TransferData> {
         };
 
         match dir {
-            Direction::In => {
-                unsafe {
-                    (*alias).status = Some(io::read(&fd, buf));
-                }
-            }
-            Direction::Out => {
-                unsafe {
-                    (*alias).status = Some(io::write(&fd, buf));
-                }
-            }
+            Direction::In => unsafe {
+                (*alias).status = Some(io::read(&fd, buf));
+            },
+            Direction::Out => unsafe {
+                (*alias).status = Some(io::write(&fd, buf));
+            },
         }
     }
 
@@ -172,8 +168,6 @@ impl Pending<TransferData> {
                     unsafe {
                         (*alias).status = Some(io::read(&fd, buf));
                     }
-                        (*alias).status
-                    });
                 }
                 // Nothing else to do with out
                 Direction::Out => {}
