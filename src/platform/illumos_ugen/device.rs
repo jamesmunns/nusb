@@ -96,14 +96,17 @@ impl IllumosEndpoint {
     }
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
-        let mut transfer = self.idle_transfer.take().unwrap_or_else(|| {
+        let transfer = self.idle_transfer.take().unwrap_or_else(|| {
             Idle::new(
                 self.inner.clone(),
-                super::TransferData::new(self.inner.raw.address),
+                match Direction::from_address(self.inner.raw.address) {
+                    Direction::In => super::TransferData::new_bulk_in(buffer),
+                    Direction::Out => super::TransferData::new_bulk_out(buffer)
+                }
             )
         });
 
-        transfer.set_buffer(buffer);
+        //transfer.set_buffer(buffer);
         transfer
     }
 
@@ -115,20 +118,21 @@ impl IllumosEndpoint {
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
-        //println!(">>> submitting {}", buffer.len());
+        println!(">>> submitting {}", buffer.len());
         let t = self.make_transfer(buffer);
         //let t = self.inner.interface.submit(&self.inner.fd, t);
-        let ep = t.endpoint;
-        let dir = Direction::from_address(ep);
+        //let ep = t.endpoint;
+        //let dir = Direction::from_address(ep);
         //let len = transfer.request_len;
         let pending = t.pre_submit();
 
-        pending.ep_transfer(&self.inner.fd, dir);
+        pending.transfer(&self.inner.fd);
 
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
         }
 
+        println!("done");
         self.pending.push_back(pending);
     }
 
@@ -245,7 +249,6 @@ pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> 
         fd,
         DescriptorType::String { index },
         crate::descriptors::language_id::US_ENGLISH,
-        4096,
     )?;
 
     result.truncate(result[0].into());
@@ -253,14 +256,13 @@ pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> 
 }
 
 fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u8>, Error> {
-    get_raw(fd, descriptor_type, 0, USB_CFG_DESCR_SIZE)
+    get_raw(fd, descriptor_type, 0)
 }
 
 fn get_raw(
     fd: &OwnedFd,
     descriptor_type: DescriptorType,
     index: u16,
-    length: u16,
 ) -> Result<Vec<u8>, Error> {
     #[allow(non_snake_case)]
     let wValue: u16 = descriptor_type.to_value();
@@ -397,8 +399,7 @@ impl IllumosDevice {
         let t = TransferData::new_control_in(data);
         TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
             drop(self);
-            t.status()?;
-            Ok(t.control_in_data().to_owned())
+            t.control_in_status().map(|m| m.to_owned())
         })
     }
 
@@ -470,12 +471,9 @@ impl IllumosDevice {
     }
 
     pub(crate) fn submit(&self, transfer: Idle<TransferData>) -> Pending<TransferData> {
-        let ep = transfer.endpoint;
-        let dir = Direction::from_address(ep);
-        //let len = transfer.request_len;
         let pending = transfer.pre_submit();
 
-        pending.control_transfer(&self.fd, dir);
+        pending.transfer(&self.fd);
 
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
@@ -518,34 +516,17 @@ impl IllumosInterface {
     pub fn control_in(
         &self,
         data: ControlIn,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let (t, endpoint) = TransferData::new_control_in(data);
-        TransferFuture::new(t, |t| {
-            // XXX erorr handling?
-            self.submit(self.fds.get(&endpoint).unwrap().clone(), t)
-        })
-        .map(move |mut t| {
-            let c = t.take_completion();
-            c.status?;
-            Ok(c.buffer.into_vec())
-        })
+        self.device.clone().control_in(data, timeout)
     }
 
     pub fn control_out(
         self: Arc<Self>,
         data: ControlOut,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let (t, endpoint) = TransferData::new_control_out(data);
-        // XXX error handling
-        TransferFuture::new(t, |t| {
-            self.submit(self.fds.get(&endpoint).unwrap().clone(), t)
-        })
-        .map(move |mut t| {
-            let c = t.take_completion();
-            c.status
-        })
+        self.device.clone().control_out(data, timeout)
     }
 
     pub fn set_alt_setting(
@@ -598,19 +579,6 @@ impl IllumosInterface {
             pending: VecDeque::new(),
             idle_transfer: None,
         })
-    }
-
-    pub fn submit(&self, fd: impl AsFd, transfer: Idle<TransferData>) -> Pending<TransferData> {
-        let ep = transfer.endpoint;
-        let dir = Direction::from_address(ep);
-        let pending = transfer.pre_submit();
-
-        pending.control_transfer(fd, dir);
-
-        unsafe {
-            notify_completion::<TransferData>(pending.as_ptr());
-        }
-        pending
     }
 }
 
