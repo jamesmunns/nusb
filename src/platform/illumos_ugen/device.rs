@@ -118,11 +118,10 @@ impl IllumosEndpoint {
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
-        println!(">>> submitting {}", buffer.len());
         let t = self.make_transfer(buffer);
         //let t = self.inner.interface.submit(&self.inner.fd, t);
         //let ep = t.endpoint;
-        //let dir = Direction::from_address(ep);
+        //let dir = Direction::from_address(ep:q);
         //let len = transfer.request_len;
         let pending = t.pre_submit();
 
@@ -132,7 +131,6 @@ impl IllumosEndpoint {
             notify_completion::<TransferData>(pending.as_ptr());
         }
 
-        println!("done");
         self.pending.push_back(pending);
     }
 

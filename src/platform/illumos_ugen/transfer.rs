@@ -106,7 +106,7 @@ impl TransferData {
         TransferData {
             transfer: Some(TransferType::BulkIn {
                 buf: buf.ptr,
-                len: buf.len,
+                len: buf.requested_len,
                 capacity: buf.capacity,
                 requested_len: buf.requested_len,
             }),
@@ -164,7 +164,6 @@ impl TransferData {
         self.status = None;
         let transfer = mem::replace(&mut self.transfer, None);
 
-        println!("wao");
         //let mut empty = ManuallyDrop::new(Vec::new());
         //let ptr = mem::replace(&mut self.buf, empty.as_mut_ptr());
         //let capacity = mem::replace(&mut self.capacity, 0);
@@ -279,7 +278,6 @@ impl Pending<TransferData> {
                 }
             }
             Some(TransferType::BulkIn { buf, len, .. }) => {
-                println!("transfer in {}", len);
                 let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
                 
                 unsafe {
@@ -287,14 +285,11 @@ impl Pending<TransferData> {
                 }
             }
             Some(TransferType::BulkOut { buf, len, .. }) => {
-                println!("transfer out {}", len);
                 let buf = unsafe { std::slice::from_raw_parts(*buf, *len as usize) };
-                println!("transfer buf {}", buf.len());
 
                 unsafe {
                     (*alias).status = Some(io::write(&fd, buf));
                 }
-                println!("done?");
             }
             None => {
                 panic!("state machine error");
