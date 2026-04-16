@@ -1,23 +1,22 @@
 use crate::platform::illumos_ugen::errno_to_transfer_error;
 use crate::transfer::internal::Pending;
 use crate::transfer::{
-    Buffer, Completion, ControlIn, ControlOut, Direction, TransferError, SETUP_PACKET_SIZE,
+    internal::notify_completion, Buffer, Completion, ControlIn, ControlOut, Direction,
+    TransferError, SETUP_PACKET_SIZE,
 };
-use rustix::fd::AsFd;
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use std::mem;
 use std::mem::ManuallyDrop;
 
+const AIOCB_SIZE: usize = std::mem::size_of::<libc::aiocb>();
+
 #[allow(dead_code)]
 pub struct TransferData {
-    //pub(crate) buf: *mut u8,
-    //pub(crate) endpoint: u8,
     pub(crate) status: Option<Result<usize, Errno>>,
-    //pub(crate) request_len: u32,
-    //capacity: u32,
-    //initialized_len: u32,
     transfer: Option<TransferType>,
+    aiocb: *mut libc::aiocb,
 }
 
 unsafe impl Send for TransferData {}
@@ -59,13 +58,12 @@ enum TransferType {
 impl TransferType {
     fn control_in_data(&self, len: usize) -> &[u8] {
         match self {
-            TransferType::ControlIn { buf, .. } => {
-                unsafe { std::slice::from_raw_parts(buf.add(SETUP_PACKET_SIZE), len as usize) }
-            }
+            TransferType::ControlIn { buf, .. } => unsafe {
+                std::slice::from_raw_parts(buf.add(SETUP_PACKET_SIZE), len as usize)
+            },
             _ => panic!("state machine error, this is not control in"),
         }
     }
-
 }
 
 impl TransferData {
@@ -82,6 +80,7 @@ impl TransferData {
                 requested_len: buf.len,
             }),
             status: None,
+            aiocb: std::ptr::null_mut(),
         }
     }
 
@@ -93,11 +92,12 @@ impl TransferData {
             transfer: Some(TransferType::ControlIn {
                 buf: buf.ptr,
                 total_len: buf.len,
-                data_in_len: data.length as  u32,
+                data_in_len: data.length as u32,
                 capacity: buf.capacity,
                 requested_len: buf.requested_len,
             }),
             status: None,
+            aiocb: std::ptr::null_mut(),
         }
     }
 
@@ -111,6 +111,7 @@ impl TransferData {
                 requested_len: buf.requested_len,
             }),
             status: None,
+            aiocb: std::ptr::null_mut(),
         }
     }
 
@@ -124,20 +125,9 @@ impl TransferData {
                 requested_len: buf.len,
             }),
             status: None,
+            aiocb: std::ptr::null_mut(),
         }
     }
-
-    //pub(super) fn set_buffer(&mut self, buf: Buffer) {
-    //    debug_assert!(self.capacity == 0);
-    //    let buf = ManuallyDrop::new(buf);
-    //    self.capacity = buf.capacity;
-    //    self.buf = buf.ptr;
-    //    self.request_len = match Direction::from_address(self.endpoint) {
-    //        Direction::Out => buf.len,
-    //        Direction::In => buf.requested_len,
-    //    };
-    //    self.initialized_len = buf.len;
-    //}
 
     pub fn control_in_status(&self) -> Result<&[u8], TransferError> {
         match (self.status, &self.transfer) {
@@ -164,14 +154,6 @@ impl TransferData {
         self.status = None;
         let transfer = mem::replace(&mut self.transfer, None);
 
-        //let mut empty = ManuallyDrop::new(Vec::new());
-        //let ptr = mem::replace(&mut self.buf, empty.as_mut_ptr());
-        //let capacity = mem::replace(&mut self.capacity, 0);
-        //let len = match Direction::from_address(self.endpoint) {
-        //    Direction::Out => self.request_len,
-        //    Direction::In => len as u32,
-        //};
-        //let requested_len = mem::replace(&mut self.request_len, 0);
         match transfer {
             Some(TransferType::ControlOut {
                 buf,
@@ -243,15 +225,125 @@ impl TransferData {
     }
 }
 
+enum InternalDir {
+    In,
+    Out,
+}
+
+extern "C" fn aio_callback(arg: libc::sigval) {
+    let alias: *mut TransferData = arg.sival_ptr.cast();
+
+    let aiocb = unsafe { (*alias).aiocb };
+
+    let status = match unsafe { libc::aio_error(aiocb) } {
+        // XXX unix why are you like this
+        0 => Some(Ok(unsafe { libc::aio_return(aiocb).try_into().unwrap() })),
+        n => Some(Err(Errno::from_raw_os_error(n))),
+    };
+
+    // XXX actually   read the stat fd?
+
+    unsafe {
+        (*alias).status = status;
+        notify_completion::<TransferData>(alias)
+    }
+}
+
+unsafe fn do_aio_transfer(
+    fd: i32,
+    alias: *mut TransferData,
+    aio_buf: &mut [u8],
+    aio_nbytes: libc::size_t,
+    dir: InternalDir,
+) {
+    // `aiocb` has private padding fields so alloc is the easiest way
+    // to do this
+    let layout = std::alloc::Layout::new::<libc::aiocb>();
+    let aiocb: *mut libc::aiocb = std::alloc::alloc(layout) as _;
+
+    if aiocb.is_null() {
+        panic!("failed to allocate");
+    }
+
+    (*alias).aiocb = aiocb;
+
+    (*aiocb).aio_fildes = fd;
+    (*aiocb).aio_buf = aio_buf.as_mut_ptr() as _;
+    (*aiocb).aio_lio_opcode = match dir {
+        InternalDir::In => libc::LIO_READ,
+        InternalDir::Out => libc::LIO_WRITE,
+    };
+    (*aiocb).aio_nbytes = aio_nbytes;
+    // We're always at offset 0
+    (*aiocb).aio_offset = 0;
+    // Default is fine
+    (*aiocb).aio_reqprio = 0;
+    (*aiocb).aio_sigevent.sigev_notify = libc::SIGEV_THREAD;
+    // This is not used
+    (*aiocb).aio_sigevent.sigev_signo = 0;
+    (*aiocb).aio_sigevent.ss_sp = aio_callback as *mut libc::c_void;
+    (*aiocb).aio_sigevent.sigev_value = libc::sigval {
+        sival_ptr: alias as *mut libc::c_void,
+    };
+    (*aiocb).aio_sigevent.sigev_notify_attributes = std::ptr::null();
+
+    let result = match dir {
+        InternalDir::In => libc::aio_read(aiocb),
+        InternalDir::Out => libc::aio_write(aiocb),
+    };
+
+    // aio failed, just notify the completion now
+    if result < 0 {
+        (*alias).status = Some(Err(Errno::from_raw_os_error(*unsafe { libc::___errno() })));
+        notify_completion::<TransferData>(alias)
+    }
+}
+
 impl Pending<TransferData> {
-    pub(super) fn transfer(&self, fd: impl AsFd) {
+    pub(super) fn cancel(&self) {
+        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+
+        let aiocb = unsafe { (*alias).aiocb };
+
+        if aiocb.is_null() {
+            return;
+        }
+
+        unsafe {
+            libc::aio_cancel((*aiocb).aio_fildes, &mut (*aiocb));
+        }
+    }
+
+    pub(super) fn raw_transfer(&self, raw_fd: i32) {
         // This is really ugly and I'd love another solution but it's the
         // style of the platform code...
         let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
-        
-        match unsafe { &(*alias).transfer} {
+
+        match unsafe { &(*alias).transfer } {
+            Some(TransferType::BulkIn { buf, len, .. }) => {
+                let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
+
+                unsafe {
+                    do_aio_transfer(raw_fd, alias, buf, *len as usize, InternalDir::In);
+                }
+            }
+            Some(TransferType::BulkOut { buf, len, .. }) => {
+                let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
+
+                unsafe {
+                    do_aio_transfer(raw_fd, alias, buf, *len as usize, InternalDir::Out);
+                }
+            }
+
+            _ => panic!("ugh"),
+        }
+    }
+
+    pub(super) fn transfer(&self, fd: &OwnedFd) {
+        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+
+        match unsafe { &(*alias).transfer } {
             Some(TransferType::ControlOut { buf, total_len, .. }) => {
-                // Rustix wants to work on the full buffer which is not what nusb expects
                 let buf = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
                 let status = io::write(&fd, buf);
@@ -265,100 +357,41 @@ impl Pending<TransferData> {
                 data_in_len,
                 ..
             }) => {
-                // Rustix wants to work on the full buffer which is not what nusb expects
                 let buffer = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
-                let _ = io::write(&fd, buffer);
+                let status = io::write(&fd, buffer);
+                if status.is_err() {
+                    unsafe {
+                        (*alias).status = Some(status);
+                    }
+                    return;
+                }
 
                 let buffer = unsafe {
-                    std::slice::from_raw_parts_mut((*buf).add(SETUP_PACKET_SIZE), *data_in_len as usize)
+                    std::slice::from_raw_parts_mut(
+                        (*buf).add(SETUP_PACKET_SIZE),
+                        *data_in_len as usize,
+                    )
                 };
                 unsafe {
                     (*alias).status = Some(io::read(&fd, buffer));
                 }
             }
-            Some(TransferType::BulkIn { buf, len, .. }) => {
-                let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
-                
-                unsafe {
-                    (*alias).status = Some(io::read(&fd, buf));
-                }
-            }
-            Some(TransferType::BulkOut { buf, len, .. }) => {
-                let buf = unsafe { std::slice::from_raw_parts(*buf, *len as usize) };
-
-                unsafe {
-                    (*alias).status = Some(io::write(&fd, buf));
-                }
-            }
-            None => {
+            None | Some(_) => {
                 panic!("state machine error");
             }
         }
     }
-
-    /*
-    pub(super) fn ep_transfer(&self, fd: impl AsFd, dir: Direction) {
-        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
-
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(
-                (*self.as_ptr()).buf,
-                (*self.as_ptr()).request_len as usize,
-            )
-        };
-
-        match dir {
-            Direction::In => unsafe {
-                (*alias).status = Some(io::read(&fd, buf));
-            },
-            Direction::Out => unsafe {
-                (*alias).status = Some(io::write(&fd, buf));
-            },
-        }
-    }
-
-    pub(super) fn control_transfer(&self, fd: impl AsFd, dir: Direction) {
-        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
-
-        // Rustix wants to work on the full buffer which is not what nusb expects
-        let buf = unsafe {
-            std::slice::from_raw_parts(
-                (*self.as_ptr()).buf,
-                (*self.as_ptr()).initialized_len as usize,
-            )
-        };
-
-        let status = io::write(&fd, buf);
-        unsafe {
-            (*alias).status = Some(status);
-        }
-
-        if status.is_ok() {
-            match dir {
-                Direction::In => {
-                    let buf = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (*self.as_ptr()).buf.add(SETUP_PACKET_SIZE),
-                            (*self.as_ptr()).request_len as usize,
-                        )
-                    };
-                    unsafe {
-                        (*alias).status = Some(io::read(&fd, buf));
-                    }
-                }
-                // Nothing else to do with out
-                Direction::Out => {}
-            }
-        }
-    }
-    */
 }
 
 impl Drop for TransferData {
     fn drop(&mut self) {
-        //unsafe {
-        //    drop(Vec::from_raw_parts(self.buf, 0, self.capacity as usize));
-        //}
+        if !self.aiocb.is_null() {
+            unsafe {
+                std::alloc::dealloc(self.aiocb as _, std::alloc::Layout::new::<libc::aiocb>())
+            };
+        } //unsafe {
+          //    drop(Vec::from_raw_parts(self.buf, 0, self.capacity as usize));
+          //}
     }
 }

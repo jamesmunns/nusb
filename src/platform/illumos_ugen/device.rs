@@ -18,6 +18,7 @@ use crate::transfer::{
 use crate::ErrorKind;
 use log::debug;
 use rustix::fd::AsFd;
+use rustix::fd::AsRawFd;
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::io;
@@ -90,9 +91,9 @@ impl IllumosEndpoint {
     pub(crate) fn cancel_all(&mut self) {
         // Cancel transfers in reverse order to ensure subsequent transfers
         // can't complete out of order while we're going through them.
-        //for transfer in self.pending.iter_mut().rev() {
-        //    self.inner.interface.cancel(transfer);
-        //}
+        for transfer in self.pending.iter_mut().rev() {
+            transfer.cancel();
+        }
     }
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
@@ -101,35 +102,25 @@ impl IllumosEndpoint {
                 self.inner.clone(),
                 match Direction::from_address(self.inner.raw.address) {
                     Direction::In => super::TransferData::new_bulk_in(buffer),
-                    Direction::Out => super::TransferData::new_bulk_out(buffer)
-                }
+                    Direction::Out => super::TransferData::new_bulk_out(buffer),
+                },
             )
         });
 
-        //transfer.set_buffer(buffer);
         transfer
     }
 
-    pub(crate) fn submit_err(&mut self, buffer: Buffer, _error: TransferError) {
+    pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
         let t = self.make_transfer(buffer);
-        // XXX UGHGH
-        //t.status = Some(Err(error));
+        t.status = Some(Err(error));
         self.pending.push_back(t.simulate_complete());
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
         let t = self.make_transfer(buffer);
-        //let t = self.inner.interface.submit(&self.inner.fd, t);
-        //let ep = t.endpoint;
-        //let dir = Direction::from_address(ep:q);
-        //let len = transfer.request_len;
         let pending = t.pre_submit();
 
-        pending.transfer(&self.inner.fd);
-
-        unsafe {
-            notify_completion::<TransferData>(pending.as_ptr());
-        }
+        pending.raw_transfer(self.inner.fd.as_raw_fd());
 
         self.pending.push_back(pending);
     }
@@ -178,7 +169,6 @@ impl Drop for IllumosEndpoint {
     }
 }
 
-//#[derive(Debug)]
 struct EndpointInner {
     raw: RawEndpoint,
     notify: Notify,
@@ -188,7 +178,6 @@ struct EndpointInner {
 
 impl Drop for EndpointInner {
     fn drop(&mut self) {
-        //println!("dropping {:?}", self.fd);
         let mut state = self.interface.state.lock().unwrap();
         state.endpoints.clear(self.raw.address);
     }
@@ -257,11 +246,7 @@ fn get_descriptor(fd: &OwnedFd, descriptor_type: DescriptorType) -> Result<Vec<u
     get_raw(fd, descriptor_type, 0)
 }
 
-fn get_raw(
-    fd: &OwnedFd,
-    descriptor_type: DescriptorType,
-    index: u16,
-) -> Result<Vec<u8>, Error> {
+fn get_raw(fd: &OwnedFd, descriptor_type: DescriptorType, index: u16) -> Result<Vec<u8>, Error> {
     #[allow(non_snake_case)]
     let wValue: u16 = descriptor_type.to_value();
 
@@ -455,7 +440,6 @@ impl IllumosDevice {
 
                 // XXX
                 let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).unwrap();
-                //println!(">>> {} {:x} {:?}", path, ep.address, fd);
                 fds.insert(ep.address, Arc::new(fd));
             }
 
@@ -502,7 +486,6 @@ struct InterfaceState {
 
 unsafe impl Sync for IllumosInterface {}
 
-//#[derive(Debug)]
 pub(crate) struct IllumosInterface {
     pub(crate) interface_number: u8,
     pub(crate) device: Arc<IllumosDevice>,
@@ -552,7 +535,7 @@ impl IllumosInterface {
         if state.endpoints.is_set(address) {
             return Err(Error::new(ErrorKind::Busy, "endpoint already in use"));
         }
-        // hhn error types hard
+        // This should have fewer unwraps
         let raw = self
             .device
             .interfaces
@@ -564,7 +547,6 @@ impl IllumosInterface {
 
         state.endpoints.set(address);
         let fd = self.fds.get(&address).unwrap().clone();
-        //println!("check here {:x} {fd:?} max {}", address, max_packet_size);
         Ok(IllumosEndpoint {
             inner: Arc::new(EndpointInner {
                 raw: raw.clone(),

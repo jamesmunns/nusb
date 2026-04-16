@@ -84,9 +84,13 @@ fn try_get_interface_string(path: Option<&String>, index: Option<NonZeroU8>) -> 
         return None;
     };
 
-    let fd = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).unwrap();
+    let Ok(fd) = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) else {
+        return None;
+    };
 
-    let result = get_raw_string(&fd, index.into()).unwrap();
+    let Ok(result) = get_raw_string(&fd, index.into()) else {
+        return None;
+    };
 
     decode_string_descriptor(&result).ok()
 }
