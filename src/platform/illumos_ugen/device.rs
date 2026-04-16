@@ -111,8 +111,9 @@ impl IllumosEndpoint {
     }
 
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
-        let t = self.make_transfer(buffer);
-        t.status = Some(Err(error));
+        assert_eq!(error, TransferError::InvalidArgument);
+        let mut t = self.make_transfer(buffer);
+        t.status = Some(Err(Errno::INVAL));
         self.pending.push_back(t.simulate_complete());
     }
 
