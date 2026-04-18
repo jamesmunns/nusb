@@ -317,7 +317,7 @@ impl IllumosDevice {
                 dpath
                     .device_paths
                     .get("cntrl0")
-                    .ok_or(Error::new(ErrorKind::Other, "not ugen"))?,
+                    .ok_or(Error::new(ErrorKind::Other, "not ugen").log_debug())?,
             );
 
             let fd = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
@@ -338,7 +338,7 @@ impl IllumosDevice {
                 dpath
                     .device_paths
                     .get("cntrl0stat")
-                    .ok_or(Error::new(ErrorKind::Other, "not ugen"))?,
+                    .ok_or(Error::new(ErrorKind::Other, "not ugen").log_debug())?,
             );
 
             let stat_fd =
@@ -441,11 +441,14 @@ impl IllumosDevice {
         &self,
         configuration: u8,
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
-        Blocking::new(move || todo!())
+        // It doesn't look like libusb does this either since the model
+        // of how ugen works doesn't match this
+        Blocking::new(move || todo!("Not supported"))
     }
 
     pub(crate) fn reset(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
-        Blocking::new(move || todo!())
+        // Another API that isn't as easily exposed via ugen
+        Blocking::new(move || todo!("Not supported"))
     }
 
     pub(crate) fn claim_interface(
@@ -454,7 +457,7 @@ impl IllumosDevice {
     ) -> impl MaybeFuture<Output = Result<Arc<IllumosInterface>, Error>> {
         Blocking::new(move || {
             let Some(eps) = self.interfaces.get(&interface_number) else {
-                return Err(Error::new(ErrorKind::Other, "invalid interface number"));
+                return Err(Error::new(ErrorKind::Other, "invalid interface number").log_error());
             };
 
             let mut fds = HashMap::new();
@@ -463,7 +466,7 @@ impl IllumosDevice {
                 let devname = ep.device_basename();
 
                 let Some(path) = self.paths.device_paths.get(&devname) else {
-                    return Err(Error::new(ErrorKind::Other, "bad device"));
+                    return Err(Error::new(ErrorKind::Other, "bad device").log_error());
                 };
 
                 let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).map_err(|e| {
@@ -481,7 +484,7 @@ impl IllumosDevice {
 
                 let statname = ep.stat_basename();
                 let Some(path) = self.paths.device_paths.get(&statname) else {
-                    return Err(Error::new(ErrorKind::Other, "bad device stat"));
+                    return Err(Error::new(ErrorKind::Other, "bad device stat").log_error());
                 };
 
                 let stat_fd =
@@ -603,7 +606,7 @@ impl IllumosInterface {
         let mut state = self.state.lock().unwrap();
 
         if state.endpoints.is_set(address) {
-            return Err(Error::new(ErrorKind::Busy, "endpoint already in use"));
+            return Err(Error::new(ErrorKind::Busy, "endpoint already in use").log_error());
         }
         // This should have fewer unwraps
         let raw = self
