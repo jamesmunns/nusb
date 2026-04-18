@@ -1,10 +1,10 @@
-use crate::platform::illumos_ugen::errno_to_transfer_error;
+use crate::platform::illumos_ugen::{errno_to_transfer_error, ugen_to_transfer_error};
 use crate::transfer::internal::Pending;
 use crate::transfer::{
-    internal::notify_completion, Buffer, Completion, ControlIn, ControlOut, Direction,
-    TransferError, SETUP_PACKET_SIZE,
+    internal::notify_completion, Buffer, Completion, ControlIn, ControlOut, TransferError,
+    SETUP_PACKET_SIZE,
 };
-use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use std::mem;
@@ -12,11 +12,30 @@ use std::mem::ManuallyDrop;
 
 const AIOCB_SIZE: usize = std::mem::size_of::<libc::aiocb>();
 
+// We have two possible cases for transfer errors: the raw read/write
+// failed OR the read/write succeded and the stat fd returned an error
+#[derive(Clone, Copy)]
+pub(crate) enum UsbResult {
+    Errno(Errno),
+    UgenStat(u32),
+}
+
+impl UsbResult {
+    fn to_transfer_error(self) -> TransferError {
+        match self {
+            UsbResult::Errno(e) => errno_to_transfer_error(e),
+            UsbResult::UgenStat(e) => ugen_to_transfer_error(e),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct TransferData {
-    pub(crate) status: Option<Result<usize, Errno>>,
+    pub(crate) status: Option<Result<usize, UsbResult>>,
     transfer: Option<TransferType>,
     aiocb: *mut libc::aiocb,
+    // XXX I don't love this
+    raw_stat_fd: i32,
 }
 
 unsafe impl Send for TransferData {}
@@ -81,6 +100,7 @@ impl TransferData {
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
+            raw_stat_fd: -1,
         }
     }
 
@@ -98,6 +118,7 @@ impl TransferData {
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
+            raw_stat_fd: -1,
         }
     }
 
@@ -112,6 +133,7 @@ impl TransferData {
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
+            raw_stat_fd: -1,
         }
     }
 
@@ -126,29 +148,30 @@ impl TransferData {
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
+            raw_stat_fd: -1,
         }
     }
 
     pub fn control_in_status(&self) -> Result<&[u8], TransferError> {
-        match (self.status, &self.transfer) {
+        match (&self.status, &self.transfer) {
             (None, _) | (_, None) => panic!("internal state machine error"),
-            (Some(Ok(len)), Some(t)) => Ok(t.control_in_data(len)),
-            (Some(Err(e)), _) => Err(errno_to_transfer_error(e)),
+            (Some(Ok(len)), Some(t)) => Ok(t.control_in_data(*len)),
+            (Some(Err(e)), _) => Err(e.to_transfer_error()),
         }
     }
 
     pub fn status(&self) -> Result<(), TransferError> {
-        match self.status {
+        match &self.status {
             None => Ok(()),
             Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => Err(errno_to_transfer_error(e)),
+            Some(Err(e)) => Err(e.to_transfer_error()),
         }
     }
 
     pub fn take_completion(&mut self) -> Completion {
         let (len, status) = match self.status.unwrap() {
             Ok(len) => (len, Ok(())),
-            Err(err) => (0, Err(errno_to_transfer_error(err))),
+            Err(err) => (0, Err(err.to_transfer_error())),
         };
 
         self.status = None;
@@ -236,21 +259,38 @@ extern "C" fn aio_callback(arg: libc::sigval) {
     let aiocb = unsafe { (*alias).aiocb };
 
     let status = match unsafe { libc::aio_error(aiocb) } {
-        // XXX unix why are you like this
-        0 => Some(Ok(unsafe { libc::aio_return(aiocb).try_into().unwrap() })),
-        n => Some(Err(Errno::from_raw_os_error(n))),
+        // The handling here is a mess because if `aio_error` is 0 this should
+        // always return something non-zero.
+        0 => Ok(unsafe { libc::aio_return(aiocb).try_into().unwrap() }),
+        // Once again, the ugen man page says to check this only if the return
+        // is -1
+        n => {
+            if n == -1 {
+                let mut stat: [u8; 4] = [0; 4];
+                // we expect the stat fd to still be alive at this point
+                match io::read(
+                    unsafe { BorrowedFd::borrow_raw((*alias).raw_stat_fd) },
+                    &mut stat,
+                ) {
+                    Ok(_) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                    // Return this errno?
+                    Err(errno) => Err(UsbResult::Errno(errno)),
+                }
+            } else {
+                Err(UsbResult::Errno(Errno::from_raw_os_error(n)))
+            }
+        }
     };
 
-    // XXX actually   read the stat fd?
-
     unsafe {
-        (*alias).status = status;
+        (*alias).status = Some(status);
         notify_completion::<TransferData>(alias)
     }
 }
 
 unsafe fn do_aio_transfer(
     fd: i32,
+    stat_fd: i32,
     alias: *mut TransferData,
     aio_buf: &mut [u8],
     aio_nbytes: libc::size_t,
@@ -265,6 +305,7 @@ unsafe fn do_aio_transfer(
         panic!("failed to allocate");
     }
 
+    (*alias).raw_stat_fd = stat_fd;
     (*alias).aiocb = aiocb;
 
     (*aiocb).aio_fildes = fd;
@@ -294,8 +335,33 @@ unsafe fn do_aio_transfer(
 
     // aio failed, just notify the completion now
     if result < 0 {
-        (*alias).status = Some(Err(Errno::from_raw_os_error(*unsafe { libc::___errno() })));
+        (*alias).status = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
+            libc::___errno()
+        }))));
         notify_completion::<TransferData>(alias)
+    }
+}
+
+fn handle_errno_result(
+    status: Result<usize, Errno>,
+    stat_fd: &OwnedFd,
+) -> Result<usize, UsbResult> {
+    if let Err(errno) = status {
+        // The exact wording is that if the return value is -1 we should check the
+        // stat fd
+        if errno.raw_os_error() == -1 {
+            let mut stat: [u8; 4] = [0; 4];
+            match io::read(&stat_fd, &mut stat) {
+                Ok(_) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                // Return this errno?
+                Err(errno) => Err(UsbResult::Errno(errno)),
+            }
+        } else {
+            // Some other error dealing with the
+            status.map_err(UsbResult::Errno)
+        }
+    } else {
+        status.map_err(UsbResult::Errno)
     }
 }
 
@@ -314,7 +380,7 @@ impl Pending<TransferData> {
         }
     }
 
-    pub(super) fn raw_transfer(&self, raw_fd: i32) {
+    pub(super) fn raw_transfer(&self, raw_fd: i32, raw_stat_fd: i32) {
         // This is really ugly and I'd love another solution but it's the
         // style of the platform code...
         let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
@@ -324,14 +390,28 @@ impl Pending<TransferData> {
                 let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
 
                 unsafe {
-                    do_aio_transfer(raw_fd, alias, buf, *len as usize, InternalDir::In);
+                    do_aio_transfer(
+                        raw_fd,
+                        raw_stat_fd,
+                        alias,
+                        buf,
+                        *len as usize,
+                        InternalDir::In,
+                    );
                 }
             }
             Some(TransferType::BulkOut { buf, len, .. }) => {
                 let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
 
                 unsafe {
-                    do_aio_transfer(raw_fd, alias, buf, *len as usize, InternalDir::Out);
+                    do_aio_transfer(
+                        raw_fd,
+                        raw_stat_fd,
+                        alias,
+                        buf,
+                        *len as usize,
+                        InternalDir::Out,
+                    );
                 }
             }
 
@@ -339,14 +419,14 @@ impl Pending<TransferData> {
         }
     }
 
-    pub(super) fn transfer(&self, fd: &OwnedFd) {
+    pub(super) fn transfer(&self, fd: &OwnedFd, stat_fd: &OwnedFd) {
         let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
 
         match unsafe { &(*alias).transfer } {
             Some(TransferType::ControlOut { buf, total_len, .. }) => {
                 let buf = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
-                let status = io::write(&fd, buf);
+                let status = handle_errno_result(io::write(&fd, buf), stat_fd);
                 unsafe {
                     (*alias).status = Some(status);
                 }
@@ -359,7 +439,7 @@ impl Pending<TransferData> {
             }) => {
                 let buffer = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
-                let status = io::write(&fd, buffer);
+                let status = handle_errno_result(io::write(&fd, buffer), stat_fd);
                 if status.is_err() {
                     unsafe {
                         (*alias).status = Some(status);
@@ -373,8 +453,9 @@ impl Pending<TransferData> {
                         *data_in_len as usize,
                     )
                 };
+                let status = handle_errno_result(io::read(&fd, buffer), stat_fd);
                 unsafe {
-                    (*alias).status = Some(io::read(&fd, buffer));
+                    (*alias).status = Some(status);
                 }
             }
             None | Some(_) => {

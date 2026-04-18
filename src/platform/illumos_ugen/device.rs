@@ -7,6 +7,7 @@ use crate::descriptors::{
     EndpointDescriptor, TransferType,
 };
 use crate::maybe_future::{blocking::Blocking, MaybeFuture};
+use crate::platform::illumos_ugen::transfer::UsbResult;
 use crate::platform::illumos_ugen::Errno;
 use crate::platform::TransferData;
 use crate::transfer::{
@@ -17,12 +18,12 @@ use crate::transfer::{
 };
 use crate::ErrorKind;
 use log::debug;
-use rustix::fd::AsFd;
 use rustix::fd::AsRawFd;
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::io;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZero;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -113,7 +114,7 @@ impl IllumosEndpoint {
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
         assert_eq!(error, TransferError::InvalidArgument);
         let mut t = self.make_transfer(buffer);
-        t.status = Some(Err(Errno::INVAL));
+        t.status = Some(Err(UsbResult::Errno(Errno::INVAL)));
         self.pending.push_back(t.simulate_complete());
     }
 
@@ -121,7 +122,7 @@ impl IllumosEndpoint {
         let t = self.make_transfer(buffer);
         let pending = t.pre_submit();
 
-        pending.raw_transfer(self.inner.fd.as_raw_fd());
+        pending.raw_transfer(self.inner.fd.as_raw_fd(), self.inner.stat_fd.as_raw_fd());
 
         self.pending.push_back(pending);
     }
@@ -175,6 +176,7 @@ struct EndpointInner {
     notify: Notify,
     interface: Arc<IllumosInterface>,
     fd: Arc<OwnedFd>,
+    stat_fd: Arc<OwnedFd>,
 }
 
 impl Drop for EndpointInner {
@@ -212,6 +214,10 @@ impl RawEndpoint {
         )
     }
 
+    fn stat_basename(&self) -> String {
+        format!("{}stat", self.device_basename())
+    }
+
     fn open_flags(&self) -> OFlags {
         OFlags::CLOEXEC
             | match self.direction {
@@ -223,8 +229,8 @@ impl RawEndpoint {
 
 //#[derive(Debug)]
 pub(crate) struct IllumosDevice {
-    #[allow(dead_code)]
     fd: OwnedFd,
+    stat_fd: OwnedFd,
     device_descriptor: Vec<u8>,
     config_descriptors: Vec<u8>,
     active_config: u8,
@@ -265,7 +271,7 @@ fn get_raw(fd: &OwnedFd, descriptor_type: DescriptorType, index: u16) -> Result<
     let mut buf = [0u8; USB_CFG_DESCR_SIZE as usize];
     io::read(fd, &mut buf).unwrap();
 
-    let total = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as u16;
+    let total = u16::from_le_bytes(buf[2..4].try_into().unwrap());
     control.length = total;
     control.index = index;
 
@@ -330,6 +336,28 @@ impl IllumosDevice {
                     .log_debug()
                 })?;
 
+            let stat_path = Path::new(
+                dpath
+                    .device_paths
+                    .get("cntrl0stat")
+                    .ok_or(Error::new(ErrorKind::Other, "not ugen"))?,
+            );
+
+            let stat_fd =
+                rustix::fs::open(stat_path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+                    .map_err(|e| {
+                        match e {
+                            Errno::NOENT => {
+                                Error::new_os(ErrorKind::Disconnected, "device not found", e)
+                            }
+                            Errno::PERM => {
+                                Error::new_os(ErrorKind::PermissionDenied, "permission denied", e)
+                            }
+                            e => Error::new_os(ErrorKind::Other, "failed to open device", e),
+                        }
+                        .log_debug()
+                    })?;
+
             let device_descriptor = get_descriptor(&fd, DescriptorType::Device)?;
             let active_config = get_configuration(&fd)?;
 
@@ -362,6 +390,7 @@ impl IllumosDevice {
 
             Ok(Arc::new(Self {
                 fd,
+                stat_fd,
                 device_descriptor,
                 config_descriptors,
                 active_config,
@@ -439,9 +468,46 @@ impl IllumosDevice {
                     return Err(Error::new(ErrorKind::Other, "bad device"));
                 };
 
-                // XXX
-                let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).unwrap();
-                fds.insert(ep.address, Arc::new(fd));
+                let fd = rustix::fs::open(path, ep.open_flags(), Mode::empty()).map_err(|e| {
+                    let e: Option<u32> = e.raw_os_error().try_into().ok();
+                    let code: Option<NonZero<u32>> = match e {
+                        None => None,
+                        Some(v) => v.try_into().ok(),
+                    };
+                    Error {
+                        kind: ErrorKind::Other,
+                        message: "opening device fd failed",
+                        code,
+                    }
+                })?;
+
+                let statname = ep.stat_basename();
+                let Some(path) = self.paths.device_paths.get(&statname) else {
+                    return Err(Error::new(ErrorKind::Other, "bad device stat"));
+                };
+
+                let stat_fd =
+                    rustix::fs::open(path, ep.open_flags(), Mode::empty()).map_err(|e| {
+                        let e: Option<u32> = e.raw_os_error().try_into().ok();
+                        let code: Option<NonZero<u32>> = match e {
+                            None => None,
+                            Some(v) => v.try_into().ok(),
+                        };
+
+                        Error {
+                            kind: ErrorKind::Other,
+                            message: "opening device stat fd failed",
+                            code,
+                        }
+                    })?;
+
+                fds.insert(
+                    ep.address,
+                    IllumosUsbFds {
+                        fd: Arc::new(fd),
+                        stat_fd: Arc::new(stat_fd),
+                    },
+                );
             }
 
             Ok(Arc::new(IllumosInterface {
@@ -456,7 +522,7 @@ impl IllumosDevice {
     pub(crate) fn submit(&self, transfer: Idle<TransferData>) -> Pending<TransferData> {
         let pending = transfer.pre_submit();
 
-        pending.transfer(&self.fd);
+        pending.transfer(&self.fd, &self.stat_fd);
 
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
@@ -487,10 +553,15 @@ struct InterfaceState {
 
 unsafe impl Sync for IllumosInterface {}
 
+struct IllumosUsbFds {
+    fd: Arc<OwnedFd>,
+    stat_fd: Arc<OwnedFd>,
+}
+
 pub(crate) struct IllumosInterface {
     pub(crate) interface_number: u8,
     pub(crate) device: Arc<IllumosDevice>,
-    pub(crate) fds: HashMap<u8, Arc<OwnedFd>>,
+    fds: HashMap<u8, IllumosUsbFds>,
     state: Mutex<InterfaceState>,
 }
 
@@ -547,12 +618,13 @@ impl IllumosInterface {
             .unwrap();
 
         state.endpoints.set(address);
-        let fd = self.fds.get(&address).unwrap().clone();
+        let fds = self.fds.get(&address).unwrap();
         Ok(IllumosEndpoint {
             inner: Arc::new(EndpointInner {
                 raw: raw.clone(),
                 interface: self.clone(),
-                fd,
+                fd: fds.fd.clone(),
+                stat_fd: fds.stat_fd.clone(),
                 notify: Notify::new(),
             }),
             max_packet_size,
