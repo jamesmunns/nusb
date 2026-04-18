@@ -1,7 +1,7 @@
 #[cfg(target_os = "windows")]
 use std::ffi::{OsStr, OsString};
 
-#[cfg(any(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use crate::platform::SysfsPath;
 
 #[cfg(target_os = "illumos")]
@@ -150,7 +150,7 @@ impl DeviceInfo {
     /// *(Linux-only)* Bus number.
     ///
     /// On Linux, the `bus_id` is an integer and this provides the value as `u8`.
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub fn busnum(&self) -> u8 {
         self.busnum
     }
@@ -539,14 +539,14 @@ impl UsbControllerType {
     target_os = "illumos"
 ))]
 pub struct BusInfo {
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) path: SysfsPath,
 
     /// The phony root hub device
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) root_hub: DeviceInfo,
 
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) busnum: u8,
 
     #[cfg(target_os = "windows")]
@@ -596,7 +596,7 @@ pub struct BusInfo {
 ))]
 impl BusInfo {
     /// *(Linux-only)* Sysfs path for the bus.
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub fn sysfs_path(&self) -> &std::path::Path {
         &self.path.0
     }
@@ -604,13 +604,13 @@ impl BusInfo {
     /// *(Linux-only)* Bus number.
     ///
     /// On Linux, the `bus_id` is an integer and this provides the value as `u8`.
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub fn busnum(&self) -> u8 {
         self.busnum
     }
 
     /// *(Linux-only)* The root hub [`DeviceInfo`] representing the bus.
-    #[cfg(any(target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub fn root_hub(&self) -> &DeviceInfo {
         &self.root_hub
     }
@@ -726,7 +726,7 @@ impl std::fmt::Debug for BusInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("BusInfo");
 
-        #[cfg(any(target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         {
             s.field("sysfs_path", &self.path);
             s.field("busnum", &self.busnum);

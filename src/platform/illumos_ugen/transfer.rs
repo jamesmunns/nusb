@@ -7,13 +7,11 @@ use crate::transfer::{
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
-use std::mem;
 use std::mem::ManuallyDrop;
 
-const AIOCB_SIZE: usize = std::mem::size_of::<libc::aiocb>();
-
 // We have two possible cases for transfer errors: the raw read/write
-// failed OR the read/write succeded and the stat fd returned an error
+// failed OR the read/write succeded and the stat fd returned an error.
+// In the future I would love to differentiate these further...
 #[derive(Clone, Copy)]
 pub(crate) enum UsbResult {
     Errno(Errno),
@@ -78,7 +76,7 @@ impl TransferType {
     fn control_in_data(&self, len: usize) -> &[u8] {
         match self {
             TransferType::ControlIn { buf, .. } => unsafe {
-                std::slice::from_raw_parts(buf.add(SETUP_PACKET_SIZE), len as usize)
+                std::slice::from_raw_parts(buf.add(SETUP_PACKET_SIZE), len)
             },
             _ => panic!("state machine error, this is not control in"),
         }
@@ -175,7 +173,7 @@ impl TransferData {
         };
 
         self.status = None;
-        let transfer = mem::replace(&mut self.transfer, None);
+        let transfer = self.transfer.take();
 
         match transfer {
             Some(TransferType::ControlOut {
@@ -202,7 +200,7 @@ impl TransferData {
                 capacity,
             }) => Completion {
                 status,
-                actual_len: len as usize,
+                actual_len: len,
                 buffer: Buffer {
                     ptr: buf,
                     len: len as u32,
@@ -218,7 +216,7 @@ impl TransferData {
                 capacity,
             }) => Completion {
                 status,
-                actual_len: len as usize,
+                actual_len: len,
                 buffer: Buffer {
                     ptr: buf,
                     len: len as u32,
@@ -234,7 +232,7 @@ impl TransferData {
                 capacity,
             }) => Completion {
                 status,
-                actual_len: len as usize,
+                actual_len: len,
                 buffer: Buffer {
                     ptr: buf,
                     len: len as u32,
@@ -351,7 +349,7 @@ fn handle_errno_result(
         // stat fd
         if errno.raw_os_error() == -1 {
             let mut stat: [u8; 4] = [0; 4];
-            match io::read(&stat_fd, &mut stat) {
+            match io::read(stat_fd, &mut stat) {
                 Ok(_) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
                 // Return this errno?
                 Err(errno) => Err(UsbResult::Errno(errno)),
@@ -426,7 +424,7 @@ impl Pending<TransferData> {
             Some(TransferType::ControlOut { buf, total_len, .. }) => {
                 let buf = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
-                let status = handle_errno_result(io::write(&fd, buf), stat_fd);
+                let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 unsafe {
                     (*alias).status = Some(status);
                 }
@@ -439,7 +437,7 @@ impl Pending<TransferData> {
             }) => {
                 let buffer = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
 
-                let status = handle_errno_result(io::write(&fd, buffer), stat_fd);
+                let status = handle_errno_result(io::write(fd, buffer), stat_fd);
                 if status.is_err() {
                     unsafe {
                         (*alias).status = Some(status);
@@ -453,7 +451,7 @@ impl Pending<TransferData> {
                         *data_in_len as usize,
                     )
                 };
-                let status = handle_errno_result(io::read(&fd, buffer), stat_fd);
+                let status = handle_errno_result(io::read(fd, buffer), stat_fd);
                 unsafe {
                     (*alias).status = Some(status);
                 }

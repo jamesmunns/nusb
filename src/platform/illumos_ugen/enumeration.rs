@@ -68,7 +68,7 @@ fn walk_buses() -> Result<impl Iterator<Item = BusInfo>, Error> {
                     .as_ref()
                     .and_then(|p| UsbControllerType::from_str(p)),
             });
-            bus = bus + 1;
+            bus += 1;
             continue;
         }
     }
@@ -76,13 +76,9 @@ fn walk_buses() -> Result<impl Iterator<Item = BusInfo>, Error> {
 }
 
 fn try_get_interface_string(path: Option<&String>, index: Option<NonZeroU8>) -> Option<String> {
-    let Some(path) = path else {
-        return None;
-    };
+    let path = path?;
 
-    let Some(index) = index else {
-        return None;
-    };
+    let index = index?;
 
     let Ok(fd) = rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) else {
         return None;
@@ -151,7 +147,7 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
 
         let depth = n.depth();
 
-        while hubs.len() > 0 && hubs[hubs.len() - 1].depth >= depth {
+        while !hubs.is_empty() && hubs[hubs.len() - 1].depth >= depth {
             hubs.pop();
         }
 

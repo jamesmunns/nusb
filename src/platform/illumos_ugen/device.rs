@@ -98,7 +98,7 @@ impl IllumosEndpoint {
     }
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
-        let transfer = self.idle_transfer.take().unwrap_or_else(|| {
+        self.idle_transfer.take().unwrap_or_else(|| {
             Idle::new(
                 self.inner.clone(),
                 match Direction::from_address(self.inner.raw.address) {
@@ -106,9 +106,7 @@ impl IllumosEndpoint {
                     Direction::Out => super::TransferData::new_bulk_out(buffer),
                 },
             )
-        });
-
-        transfer
+        })
     }
 
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
@@ -395,7 +393,7 @@ impl IllumosDevice {
                 config_descriptors,
                 active_config,
                 paths: dpath.clone(),
-                interfaces: interfaces,
+                interfaces,
             }))
         })
     }
