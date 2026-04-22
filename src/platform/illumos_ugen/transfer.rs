@@ -73,9 +73,7 @@ impl TransferData {
         buffer.extend_from_slice(data.data);
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::ControlOut {
-                buffer,
-            }),
+            transfer: Some(TransferType::ControlOut { buffer }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -100,9 +98,7 @@ impl TransferData {
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::BulkIn {
-                buffer,
-            }),
+            transfer: Some(TransferType::BulkIn { buffer }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -112,9 +108,7 @@ impl TransferData {
     pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::BulkOut {
-                buffer,
-            }),
+            transfer: Some(TransferType::BulkOut { buffer }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -343,33 +337,35 @@ impl Pending<TransferData> {
     }
 
     pub(super) fn transfer(&self, fd: &OwnedFd, stat_fd: &OwnedFd) {
-        let alias: *mut TransferData = self.as_ptr();
+        // SAFETY We're taking full ownership of this to the transfer
+        let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
-        match unsafe { &(*alias).transfer } {
+        //match unsafe { &(*alias).transfer } {
+        match &alias.transfer {
             Some(TransferType::ControlOut { buffer }) => {
-                let buf =
-                    unsafe { std::slice::from_raw_parts((*buffer).ptr, (*buffer).len as usize) };
+                // SAFETY: this is reconstructing the buffer because rustix takes a slice
+                // (as opposed to most platform APIs which do *magic* on the pointer
+                let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
 
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
-                unsafe {
-                    (*alias).status = Some(status);
-                }
+                alias.status = Some(status);
             }
             Some(TransferType::ControlIn {
                 buffer,
                 data_in_len,
             }) => {
+                // SAFETY: this is reconstructing the buffer because rustix takes a slice
+                // (as opposed to most platform APIs which do *magic* on the pointer
                 let buf =
                     unsafe { std::slice::from_raw_parts((*buffer).ptr, (*buffer).len as usize) };
 
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 if status.is_err() {
-                    unsafe {
-                        (*alias).status = Some(status);
-                    }
+                    alias.status = Some(status);
                     return;
                 }
 
+                // SAFETY: same logic applies, this is our buffer we have constructed
                 let buffer = unsafe {
                     std::slice::from_raw_parts_mut(
                         (*buffer).ptr.add(SETUP_PACKET_SIZE),
@@ -377,9 +373,7 @@ impl Pending<TransferData> {
                     )
                 };
                 let status = handle_errno_result(io::read(fd, buffer), stat_fd);
-                unsafe {
-                    (*alias).status = Some(status);
-                }
+                alias.status = Some(status);
             }
             None | Some(_) => {
                 panic!("state machine error");
