@@ -4,11 +4,11 @@ use crate::transfer::{
     internal::notify_completion, Buffer, Completion, ControlIn, ControlOut, TransferError,
     SETUP_PACKET_SIZE,
 };
+use core::mem::MaybeUninit;
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use std::mem::ManuallyDrop;
-use core::mem::MaybeUninit;
 
 // We have two possible cases for transfer errors: the raw read/write
 // failed OR the read/write succeded and the stat fd returned an error.
@@ -57,13 +57,20 @@ enum TransferType {
 }
 
 impl TransferType {
-    fn control_in_data(&self, len: usize) -> &[u8] {
-        match self {
-            TransferType::ControlIn { buffer, .. } => unsafe {
-                std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len)
-            },
-            _ => panic!("state machine error, this is not control in"),
+    fn control_in_data(&self, len: usize) -> Result<&[u8], TransferError> {
+        let TransferType::ControlIn { buffer, .. } = self else {
+            panic!("state machine error, this is not control in");
+        };
+        // This case should be in practice impossible because `len` is the
+        // result that we read out. We could attempt to bubble up an error
+        // but `TransferError` doesn't have a way to do internal error at
+        // the moment
+        if len >= buffer.len() {
+            panic!("internal error {} is greater than {}", len, buffer.len());
         }
+        // SAFETY this is what was construted and previously passed to the kernel
+        // to read out
+        Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len) })
     }
 }
 
@@ -119,7 +126,7 @@ impl TransferData {
     pub fn control_in_status(&self) -> Result<&[u8], TransferError> {
         match (&self.status, &self.transfer) {
             (None, _) | (_, None) => panic!("internal state machine error"),
-            (Some(Ok(len)), Some(t)) => Ok(t.control_in_data(*len)),
+            (Some(Ok(len)), Some(t)) => t.control_in_data(*len),
             (Some(Err(e)), _) => Err(e.to_transfer_error()),
         }
     }
@@ -232,7 +239,7 @@ unsafe fn do_aio_transfer(
     // cleanest way to model this structure.
     // in the future it would be nifty to just use
     // Box::<libc::aiocb>::new_zeroed()
-    let mut aiocb = Box::new(MaybeUninit::<libc::aiocb>::zeroed()); 
+    let mut aiocb = Box::new(MaybeUninit::<libc::aiocb>::zeroed());
     let aiocb_ptr = aiocb.as_mut_ptr();
 
     alias.raw_stat_fd = stat_fd;
@@ -261,7 +268,7 @@ unsafe fn do_aio_transfer(
     // We are done. The assumption is we will only use this transfer request once
     let mut aiocb_init = aiocb.assume_init();
     alias.aiocb = aiocb_init.as_mut();
-    
+
     let result = match dir {
         InternalDir::In => libc::aio_read(aiocb_init.as_mut()),
         InternalDir::Out => libc::aio_write(aiocb_init.as_mut()),
@@ -281,23 +288,22 @@ fn handle_errno_result(
     status: Result<usize, Errno>,
     stat_fd: &OwnedFd,
 ) -> Result<usize, UsbResult> {
-    if let Err(errno) = status {
-        // The exact wording is that if the return value is -1 we should check the
-        // stat fd
-        if errno.raw_os_error() == -1 {
-            let mut stat: [u8; 4] = [0; 4];
-            match io::read(stat_fd, &mut stat) {
-                Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
-                    // man page example just returns the unspecified error
-                Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
-                Err(errno) => Err(UsbResult::Errno(errno)),
-            }
-        } else {
-            // Some other error dealing with the reading/writing. Treat this
-            // a a standard errno
-            status.map_err(UsbResult::Errno)
+    let Err(errno) = status else {
+        return status.map_err(UsbResult::Errno);
+    };
+    // The exact wording is that if the return value is -1 we should check the
+    // stat fd
+    if errno.raw_os_error() == -1 {
+        let mut stat: [u8; 4] = [0; 4];
+        match io::read(stat_fd, &mut stat) {
+            Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+            // man page example just returns the unspecified error
+            Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
+            Err(errno) => Err(UsbResult::Errno(errno)),
         }
     } else {
+        // Some other error dealing with the reading/writing. Treat this
+        // a a standard errno
         status.map_err(UsbResult::Errno)
     }
 }
@@ -370,8 +376,7 @@ impl Pending<TransferData> {
             }) => {
                 // SAFETY: this is reconstructing the buffer because rustix takes a slice
                 // (as opposed to most platform APIs which do *magic* on the pointer
-                let buf =
-                    unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
+                let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
 
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 if status.is_err() {
