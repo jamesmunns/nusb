@@ -8,6 +8,7 @@ use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
 use std::mem::ManuallyDrop;
+use core::mem::MaybeUninit;
 
 // We have two possible cases for transfer errors: the raw read/write
 // failed OR the read/write succeded and the stat fd returned an error.
@@ -31,7 +32,7 @@ pub struct TransferData {
     pub(crate) status: Option<Result<usize, UsbResult>>,
     transfer: Option<TransferType>,
     aiocb: *mut libc::aiocb,
-    // XXX I don't love this
+    // We need this for aio error handling via the raw fd
     raw_stat_fd: i32,
 }
 
@@ -179,26 +180,31 @@ enum InternalDir {
     Out,
 }
 
+const USB_LC_STAT_UNSPECIFIED_ERR: u32 = 0xe;
+
 extern "C" fn aio_callback(arg: libc::sigval) {
-    let alias: *mut TransferData = arg.sival_ptr.cast();
+    // SAFETY We're back from the kernel and we have ownership again
+    let alias: &mut TransferData = unsafe { &mut *arg.sival_ptr.cast() };
 
-    let aiocb = unsafe { (*alias).aiocb };
-
-    let status = match unsafe { libc::aio_error(aiocb) } {
+    let status = match unsafe { libc::aio_error(alias.aiocb) } {
         // The handling here is a mess because if `aio_error` is 0 this should
-        // always return something non-zero.
-        0 => Ok(unsafe { libc::aio_return(aiocb).try_into().unwrap() }),
+        // always return something non-zero. This means the unwrap should
+        // be fine
+        0 => Ok(unsafe { libc::aio_return(alias.aiocb).try_into().unwrap() }),
         // Once again, the ugen man page says to check this only if the return
         // is -1
         n => {
             if n == -1 {
                 let mut stat: [u8; 4] = [0; 4];
-                // we expect the stat fd to still be alive at this point
                 match io::read(
-                    unsafe { BorrowedFd::borrow_raw((*alias).raw_stat_fd) },
+                    // SAFETY we expect the stat fd to still be alive at this point
+                    // and we stored it explicitly
+                    unsafe { BorrowedFd::borrow_raw(alias.raw_stat_fd) },
                     &mut stat,
                 ) {
-                    Ok(_) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                    Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                    // man page example just returns the unspecified error
+                    Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
                     // Return this errno?
                     Err(errno) => Err(UsbResult::Errno(errno)),
                 }
@@ -217,52 +223,54 @@ extern "C" fn aio_callback(arg: libc::sigval) {
 unsafe fn do_aio_transfer(
     fd: i32,
     stat_fd: i32,
-    alias: *mut TransferData,
-    //aio_buf: &mut [u8],
+    alias: &mut TransferData,
     aio_buf: *mut u8,
     aio_nbytes: libc::size_t,
     dir: InternalDir,
 ) {
-    // `aiocb` has private padding fields so alloc is the easiest way
-    // to do this
-    let layout = std::alloc::Layout::new::<libc::aiocb>();
-    let aiocb: *mut libc::aiocb = std::alloc::alloc(layout) as _;
+    // `aiocb` has private padding fields so MaybeUninit::zeroed is the
+    // cleanest way to model this structure.
+    // in the future it would be nifty to just use
+    // Box::<libc::aiocb>::new_zeroed()
+    let mut aiocb = Box::new(MaybeUninit::<libc::aiocb>::zeroed()); 
+    let aiocb_ptr = aiocb.as_mut_ptr();
 
-    if aiocb.is_null() {
-        panic!("failed to allocate");
-    }
+    alias.raw_stat_fd = stat_fd;
 
-    (*alias).raw_stat_fd = stat_fd;
-    (*alias).aiocb = aiocb;
-
-    (*aiocb).aio_fildes = fd;
-    (*aiocb).aio_buf = aio_buf.cast::<libc::c_void>();
-    (*aiocb).aio_lio_opcode = match dir {
+    // https://doc.rust-lang.org/stable/core/mem/union.MaybeUninit.html#initializing-a-struct-field-by-field
+    (&raw mut (*aiocb_ptr).aio_fildes).write(fd);
+    (&raw mut (*aiocb_ptr).aio_buf).write(aio_buf.cast::<libc::c_void>());
+    (&raw mut (*aiocb_ptr).aio_lio_opcode).write(match dir {
         InternalDir::In => libc::LIO_READ,
         InternalDir::Out => libc::LIO_WRITE,
-    };
-    (*aiocb).aio_nbytes = aio_nbytes;
-    // We're always at offset 0
-    (*aiocb).aio_offset = 0;
+    });
+    (&raw mut (*aiocb_ptr).aio_nbytes).write(aio_nbytes);
+    // We're always at offset zero
+    (&raw mut (*aiocb_ptr).aio_offset).write(0);
     // Default is fine
-    (*aiocb).aio_reqprio = 0;
-    (*aiocb).aio_sigevent.sigev_notify = libc::SIGEV_THREAD;
-    // This is not used
-    (*aiocb).aio_sigevent.sigev_signo = 0;
-    (*aiocb).aio_sigevent.ss_sp = aio_callback as *mut libc::c_void;
-    (*aiocb).aio_sigevent.sigev_value = libc::sigval {
-        sival_ptr: alias as *mut libc::c_void,
-    };
-    (*aiocb).aio_sigevent.sigev_notify_attributes = std::ptr::null();
+    (&raw mut (*aiocb_ptr).aio_reqprio).write(0);
+    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_notify).write(libc::SIGEV_THREAD);
+    // This is not used, here for clarity
+    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_signo).write(0);
+    (&raw mut (*aiocb_ptr).aio_sigevent.ss_sp).write(aio_callback as *mut libc::c_void);
+    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_value).write(libc::sigval {
+        sival_ptr: alias as *mut TransferData as *mut libc::c_void,
+    });
+    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_notify_attributes).write(std::ptr::null());
 
+    // We are done. The assumption is we will only use this transfer request once
+    let mut aiocb_init = aiocb.assume_init();
+    alias.aiocb = aiocb_init.as_mut();
+    
     let result = match dir {
-        InternalDir::In => libc::aio_read(aiocb),
-        InternalDir::Out => libc::aio_write(aiocb),
+        InternalDir::In => libc::aio_read(aiocb_init.as_mut()),
+        InternalDir::Out => libc::aio_write(aiocb_init.as_mut()),
     };
 
     // aio failed, just notify the completion now
+    // The status will be updated in the callback for other cases
     if result < 0 {
-        (*alias).status = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
+        alias.status = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
             libc::___errno()
         }))));
         notify_completion::<TransferData>(alias)
@@ -279,12 +287,14 @@ fn handle_errno_result(
         if errno.raw_os_error() == -1 {
             let mut stat: [u8; 4] = [0; 4];
             match io::read(stat_fd, &mut stat) {
-                Ok(_) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
-                // Return this errno?
+                Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                    // man page example just returns the unspecified error
+                Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
                 Err(errno) => Err(UsbResult::Errno(errno)),
             }
         } else {
-            // Some other error dealing with the
+            // Some other error dealing with the reading/writing. Treat this
+            // a a standard errno
             status.map_err(UsbResult::Errno)
         }
     } else {
@@ -294,30 +304,34 @@ fn handle_errno_result(
 
 impl Pending<TransferData> {
     pub(super) fn cancel(&self) {
-        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+        // SAFETY this is slightly unsafe because a transfer may be in flight
+        // but importantly we're not touching the data itself, only getting
+        // the pointer
+        let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
-        let aiocb = unsafe { (*alias).aiocb };
+        let aiocb = alias.aiocb;
 
         if aiocb.is_null() {
             return;
         }
 
         unsafe {
-            libc::aio_cancel((*aiocb).aio_fildes, &mut (*aiocb));
+            libc::aio_cancel((*aiocb).aio_fildes, aiocb);
         }
     }
 
     pub(super) fn raw_transfer(&self, raw_fd: i32, raw_stat_fd: i32) {
-        let alias: *mut TransferData = self.as_ptr();
+        // SAFETY We're taking full ownership of this to do the transfer
+        let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
-        match unsafe { &(*alias).transfer } {
+        match &alias.transfer {
             Some(TransferType::BulkIn { buffer }) => unsafe {
                 do_aio_transfer(
                     raw_fd,
                     raw_stat_fd,
                     alias,
-                    (*buffer).ptr,
-                    (*buffer).requested_len as usize,
+                    buffer.ptr,
+                    buffer.requested_len as usize,
                     InternalDir::In,
                 );
             },
@@ -326,8 +340,8 @@ impl Pending<TransferData> {
                     raw_fd,
                     raw_stat_fd,
                     alias,
-                    (*buffer).ptr,
-                    (*buffer).len as usize,
+                    buffer.ptr,
+                    buffer.len as usize,
                     InternalDir::Out,
                 );
             },
@@ -337,7 +351,7 @@ impl Pending<TransferData> {
     }
 
     pub(super) fn transfer(&self, fd: &OwnedFd, stat_fd: &OwnedFd) {
-        // SAFETY We're taking full ownership of this to the transfer
+        // SAFETY We're taking full ownership of this to do the transfer
         let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
         //match unsafe { &(*alias).transfer } {
@@ -357,7 +371,7 @@ impl Pending<TransferData> {
                 // SAFETY: this is reconstructing the buffer because rustix takes a slice
                 // (as opposed to most platform APIs which do *magic* on the pointer
                 let buf =
-                    unsafe { std::slice::from_raw_parts((*buffer).ptr, (*buffer).len as usize) };
+                    unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
 
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 if status.is_err() {
@@ -384,11 +398,9 @@ impl Pending<TransferData> {
 
 impl Drop for TransferData {
     fn drop(&mut self) {
-        if !self.aiocb.is_null() {
-            unsafe {
-                std::alloc::dealloc(self.aiocb as _, std::alloc::Layout::new::<libc::aiocb>())
-            };
-        }
+        // self.aiocb should get automatically dropped
+
+        // If the completion was called this will be `None`
         match self.transfer.take() {
             Some(TransferType::ControlIn { buffer, .. }) => {
                 drop(ManuallyDrop::into_inner(buffer));
