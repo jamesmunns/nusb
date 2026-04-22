@@ -12,7 +12,7 @@ use std::mem::ManuallyDrop;
 // We have two possible cases for transfer errors: the raw read/write
 // failed OR the read/write succeded and the stat fd returned an error.
 // In the future I would love to differentiate these further...
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum UsbResult {
     Errno(Errno),
     UgenStat(u32),
@@ -27,7 +27,6 @@ impl UsbResult {
     }
 }
 
-#[allow(dead_code)]
 pub struct TransferData {
     pub(crate) status: Option<Result<usize, UsbResult>>,
     transfer: Option<TransferType>,
@@ -41,42 +40,26 @@ unsafe impl Sync for TransferData {}
 
 enum TransferType {
     ControlOut {
-        buf: *mut u8,
-        // total_len includes control data packet + data to send
-        total_len: u32,
-        requested_len: u32,
-        capacity: u32,
+        buffer: ManuallyDrop<Buffer>,
     },
     ControlIn {
-        buf: *mut u8,
-        // total_len includes control data packet + space to read data
-        total_len: u32,
+        buffer: ManuallyDrop<Buffer>,
         // This is the length we want to read
         data_in_len: u32,
-        requested_len: u32,
-        capacity: u32,
     },
     BulkIn {
-        buf: *mut u8,
-        // Data length to read
-        len: u32,
-        requested_len: u32,
-        capacity: u32,
+        buffer: ManuallyDrop<Buffer>,
     },
     BulkOut {
-        buf: *mut u8,
-        // Data length to write
-        len: u32,
-        requested_len: u32,
-        capacity: u32,
+        buffer: ManuallyDrop<Buffer>,
     },
 }
 
 impl TransferType {
     fn control_in_data(&self, len: usize) -> &[u8] {
         match self {
-            TransferType::ControlIn { buf, .. } => unsafe {
-                std::slice::from_raw_parts(buf.add(SETUP_PACKET_SIZE), len)
+            TransferType::ControlIn { buffer, .. } => unsafe {
+                std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len)
             },
             _ => panic!("state machine error, this is not control in"),
         }
@@ -88,13 +71,10 @@ impl TransferData {
         let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.data.len()).unwrap());
         buffer.extend_from_slice(&data.setup_packet());
         buffer.extend_from_slice(data.data);
-        let buf = ManuallyDrop::new(buffer);
+        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(TransferType::ControlOut {
-                buf: buf.ptr,
-                total_len: buf.len,
-                capacity: buf.capacity,
-                requested_len: buf.len,
+                buffer,
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
@@ -105,14 +85,11 @@ impl TransferData {
     pub(super) fn new_control_in(data: ControlIn) -> TransferData {
         let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.length as usize).unwrap());
         buffer.extend_from_slice(&data.setup_packet());
-        let buf = ManuallyDrop::new(buffer);
+        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(TransferType::ControlIn {
-                buf: buf.ptr,
-                total_len: buf.len,
+                buffer,
                 data_in_len: data.length as u32,
-                capacity: buf.capacity,
-                requested_len: buf.requested_len,
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
@@ -121,13 +98,10 @@ impl TransferData {
     }
 
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
-        let buf = ManuallyDrop::new(buffer);
+        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(TransferType::BulkIn {
-                buf: buf.ptr,
-                len: buf.requested_len,
-                capacity: buf.capacity,
-                requested_len: buf.requested_len,
+                buffer,
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
@@ -136,13 +110,10 @@ impl TransferData {
     }
 
     pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
-        let buf = ManuallyDrop::new(buffer);
+        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(TransferType::BulkOut {
-                buf: buf.ptr,
-                len: buf.len,
-                capacity: buf.capacity,
-                requested_len: buf.len,
+                buffer,
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
@@ -176,76 +147,39 @@ impl TransferData {
         let transfer = self.transfer.take();
 
         match transfer {
-            Some(TransferType::ControlOut {
-                buf,
-                total_len: _,
-                requested_len,
-                capacity,
-            }) => Completion {
+            Some(TransferType::ControlOut { buffer }) => Completion {
                 status,
-                actual_len: requested_len as usize,
-                buffer: Buffer {
-                    ptr: buf,
-                    len: requested_len,
-                    requested_len,
-                    capacity,
-                    allocator: crate::transfer::Allocator::Default,
-                },
+                actual_len: len as usize,
+                buffer: ManuallyDrop::into_inner(buffer),
             },
             Some(TransferType::ControlIn {
-                buf,
-                total_len: _,
+                buffer,
                 data_in_len: _,
-                requested_len,
-                capacity,
             }) => Completion {
                 status,
                 actual_len: len,
-                buffer: Buffer {
-                    ptr: buf,
-                    len: len as u32,
-                    requested_len,
-                    capacity,
-                    allocator: crate::transfer::Allocator::Default,
-                },
+                buffer: ManuallyDrop::into_inner(buffer),
             },
-            Some(TransferType::BulkIn {
-                buf,
-                len: _,
-                requested_len,
-                capacity,
-            }) => Completion {
+            Some(TransferType::BulkIn { buffer }) => {
+                let mut buffer = ManuallyDrop::into_inner(buffer);
+                buffer.len = len as u32;
+                Completion {
+                    status,
+                    actual_len: len,
+                    buffer,
+                }
+            }
+            Some(TransferType::BulkOut { buffer }) => Completion {
                 status,
                 actual_len: len,
-                buffer: Buffer {
-                    ptr: buf,
-                    len: len as u32,
-                    requested_len,
-                    capacity,
-                    allocator: crate::transfer::Allocator::Default,
-                },
-            },
-            Some(TransferType::BulkOut {
-                buf,
-                len: _,
-                requested_len,
-                capacity,
-            }) => Completion {
-                status,
-                actual_len: len,
-                buffer: Buffer {
-                    ptr: buf,
-                    len: len as u32,
-                    requested_len,
-                    capacity,
-                    allocator: crate::transfer::Allocator::Default,
-                },
+                buffer: ManuallyDrop::into_inner(buffer),
             },
             None => panic!("state machine error"),
         }
     }
 }
 
+#[derive(Debug)]
 enum InternalDir {
     In,
     Out,
@@ -290,7 +224,8 @@ unsafe fn do_aio_transfer(
     fd: i32,
     stat_fd: i32,
     alias: *mut TransferData,
-    aio_buf: &mut [u8],
+    //aio_buf: &mut [u8],
+    aio_buf: *mut u8,
     aio_nbytes: libc::size_t,
     dir: InternalDir,
 ) {
@@ -307,7 +242,7 @@ unsafe fn do_aio_transfer(
     (*alias).aiocb = aiocb;
 
     (*aiocb).aio_fildes = fd;
-    (*aiocb).aio_buf = aio_buf.as_mut_ptr() as _;
+    (*aiocb).aio_buf = aio_buf.cast::<libc::c_void>();
     (*aiocb).aio_lio_opcode = match dir {
         InternalDir::In => libc::LIO_READ,
         InternalDir::Out => libc::LIO_WRITE,
@@ -379,50 +314,41 @@ impl Pending<TransferData> {
     }
 
     pub(super) fn raw_transfer(&self, raw_fd: i32, raw_stat_fd: i32) {
-        // This is really ugly and I'd love another solution but it's the
-        // style of the platform code...
-        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+        let alias: *mut TransferData = self.as_ptr();
 
         match unsafe { &(*alias).transfer } {
-            Some(TransferType::BulkIn { buf, len, .. }) => {
-                let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
-
-                unsafe {
-                    do_aio_transfer(
-                        raw_fd,
-                        raw_stat_fd,
-                        alias,
-                        buf,
-                        *len as usize,
-                        InternalDir::In,
-                    );
-                }
-            }
-            Some(TransferType::BulkOut { buf, len, .. }) => {
-                let buf = unsafe { std::slice::from_raw_parts_mut(*buf, *len as usize) };
-
-                unsafe {
-                    do_aio_transfer(
-                        raw_fd,
-                        raw_stat_fd,
-                        alias,
-                        buf,
-                        *len as usize,
-                        InternalDir::Out,
-                    );
-                }
-            }
+            Some(TransferType::BulkIn { buffer }) => unsafe {
+                do_aio_transfer(
+                    raw_fd,
+                    raw_stat_fd,
+                    alias,
+                    (*buffer).ptr,
+                    (*buffer).requested_len as usize,
+                    InternalDir::In,
+                );
+            },
+            Some(TransferType::BulkOut { buffer }) => unsafe {
+                do_aio_transfer(
+                    raw_fd,
+                    raw_stat_fd,
+                    alias,
+                    (*buffer).ptr,
+                    (*buffer).len as usize,
+                    InternalDir::Out,
+                );
+            },
 
             _ => panic!("ugh"),
         }
     }
 
     pub(super) fn transfer(&self, fd: &OwnedFd, stat_fd: &OwnedFd) {
-        let alias: *mut TransferData = unsafe { &mut (*self.as_ptr()) as *mut _ };
+        let alias: *mut TransferData = self.as_ptr();
 
         match unsafe { &(*alias).transfer } {
-            Some(TransferType::ControlOut { buf, total_len, .. }) => {
-                let buf = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
+            Some(TransferType::ControlOut { buffer }) => {
+                let buf =
+                    unsafe { std::slice::from_raw_parts((*buffer).ptr, (*buffer).len as usize) };
 
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 unsafe {
@@ -430,14 +356,13 @@ impl Pending<TransferData> {
                 }
             }
             Some(TransferType::ControlIn {
-                buf,
-                total_len,
+                buffer,
                 data_in_len,
-                ..
             }) => {
-                let buffer = unsafe { std::slice::from_raw_parts(*buf, *total_len as usize) };
+                let buf =
+                    unsafe { std::slice::from_raw_parts((*buffer).ptr, (*buffer).len as usize) };
 
-                let status = handle_errno_result(io::write(fd, buffer), stat_fd);
+                let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 if status.is_err() {
                     unsafe {
                         (*alias).status = Some(status);
@@ -447,7 +372,7 @@ impl Pending<TransferData> {
 
                 let buffer = unsafe {
                     std::slice::from_raw_parts_mut(
-                        (*buf).add(SETUP_PACKET_SIZE),
+                        (*buffer).ptr.add(SETUP_PACKET_SIZE),
                         *data_in_len as usize,
                     )
                 };
@@ -469,8 +394,21 @@ impl Drop for TransferData {
             unsafe {
                 std::alloc::dealloc(self.aiocb as _, std::alloc::Layout::new::<libc::aiocb>())
             };
-        } //unsafe {
-          //    drop(Vec::from_raw_parts(self.buf, 0, self.capacity as usize));
-          //}
+        }
+        match self.transfer.take() {
+            Some(TransferType::ControlIn { buffer, .. }) => {
+                drop(ManuallyDrop::into_inner(buffer));
+            }
+            Some(TransferType::ControlOut { buffer }) => {
+                drop(ManuallyDrop::into_inner(buffer));
+            }
+            Some(TransferType::BulkIn { buffer }) => {
+                drop(ManuallyDrop::into_inner(buffer));
+            }
+            Some(TransferType::BulkOut { buffer }) => {
+                drop(ManuallyDrop::into_inner(buffer));
+            }
+            None => {}
+        }
     }
 }
