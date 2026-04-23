@@ -151,7 +151,7 @@ impl IllumosEndpoint {
         Blocking::new(move || {
             let endpoint = inner.raw.address;
             debug!("Clear halt, endpoint {endpoint:02x}");
-            todo!();
+            todo!("Check how this works");
         })
     }
 }
@@ -459,12 +459,12 @@ impl IllumosDevice {
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
         // It doesn't look like libusb does this either since the model
         // of how ugen works doesn't match this
-        Blocking::new(move || todo!("Not supported"))
+        Blocking::new(move || Err(Error::new(ErrorKind::Unsupported, "set_configuration not supported")))
     }
 
     pub(crate) fn reset(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
         // Another API that isn't as easily exposed via ugen
-        Blocking::new(move || todo!("Not supported"))
+        Blocking::new(move || Err(Error::new(ErrorKind::Unsupported, "reset not supported")))
     }
 
     pub(crate) fn claim_interface(
@@ -604,7 +604,7 @@ impl IllumosInterface {
         _alt_setting: u8,
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
         // doesn't work exactly the same here
-        Blocking::new(move || todo!("Not implemented"))
+        Blocking::new(move || Err(Error::new(ErrorKind::Unsupported, "set_alt_setting not supported")))
     }
 
     pub fn get_alt_setting(&self) -> u8 {
