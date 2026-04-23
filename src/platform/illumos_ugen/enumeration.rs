@@ -246,6 +246,7 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
                         device_paths: paths,
                     },
                     bus_id: format!("{busnum:03}"),
+                    busnum,
                     device_address,
                     port_chain: ports,
                     vendor_id: d.vendor_id(),

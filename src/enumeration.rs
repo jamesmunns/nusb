@@ -31,7 +31,7 @@ pub struct DeviceInfo {
     #[cfg(target_os = "illumos")]
     pub(crate) path: DevfsPath,
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
     pub(crate) busnum: u8,
 
     #[cfg(target_os = "windows")]
@@ -116,7 +116,7 @@ impl DeviceInfo {
             DeviceId(self.devinst)
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
         {
             DeviceId(crate::platform::DeviceId {
                 bus: self.busnum,
@@ -127,11 +127,6 @@ impl DeviceInfo {
         #[cfg(target_os = "macos")]
         {
             DeviceId(self.registry_id)
-        }
-
-        #[cfg(target_os = "illumos")]
-        {
-            DeviceId(0x1de)
         }
     }
 
@@ -711,7 +706,8 @@ impl BusInfo {
 
         #[cfg(target_os = "illumos")]
         {
-            Some("xxx")
+            // What would illumos like to put here?
+            None
         }
     }
 }

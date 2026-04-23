@@ -13,7 +13,11 @@ pub(crate) use device::IllumosInterface as Interface;
 
 use crate::transfer::TransferError;
 
-pub type DeviceId = u64;
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct DeviceId {
+    pub(crate) bus: u8,
+    pub(crate) addr: u8,
+}
 
 // from usr/src/uts/common/sys/usb/clients/ugen/usb_ugen.h
 fn ugen_to_transfer_error(e: u32) -> TransferError {
