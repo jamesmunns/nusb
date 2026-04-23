@@ -8,8 +8,9 @@ use rustix::fs::{Mode, OFlags};
 use std::collections::HashMap;
 use std::num::NonZeroU8;
 
-#[allow(dead_code)]
 #[derive(Debug)]
+// Suppress a warning about not using `Unknown`
+#[allow(dead_code)]
 enum PropVal {
     String(String),
     Bytes(Vec<u8>),
@@ -29,6 +30,29 @@ pub struct DevfsPath {
     pub device_paths: HashMap<String, String>,
 }
 
+fn build_prop_tree(mut pw: devinfo::PropertyWalk) -> HashMap<String, PropVal> {
+    let mut props = HashMap::new();
+    while let Some(p) = pw.next().transpose().unwrap() {
+        props.insert(
+            p.name(),
+            if let Some(val) = p.as_i64() {
+                PropVal::Integer(val)
+            } else if let Some(val) = p.as_bytes() {
+                PropVal::Bytes(val.to_vec())
+            } else if let Some(val) = p.to_str() {
+                PropVal::String(val)
+            } else {
+                match p.value_type() {
+                    devinfo::PropType::Boolean => PropVal::Boolean,
+                    t => PropVal::Unknown(t),
+                }
+            },
+        );
+    }
+
+    props
+}
+
 fn walk_buses() -> Result<impl Iterator<Item = BusInfo>, Error> {
     let mut di =
         devinfo::DevInfo::new().map_err(|_| Error::new(ErrorKind::Other, "dev info err"))?;
@@ -38,27 +62,9 @@ fn walk_buses() -> Result<impl Iterator<Item = BusInfo>, Error> {
     let mut buses = vec![];
 
     while let Some(n) = w.next().transpose().unwrap() {
-        let mut pw = n.props();
-        let mut props = HashMap::new();
+        let pw = n.props();
 
-        while let Some(p) = pw.next().transpose().unwrap() {
-            props.insert(
-                p.name(),
-                if let Some(val) = p.as_i64() {
-                    PropVal::Integer(val)
-                } else if let Some(val) = p.as_bytes() {
-                    PropVal::Bytes(val.to_vec())
-                } else if let Some(val) = p.to_str() {
-                    PropVal::String(val)
-                } else {
-                    match p.value_type() {
-                        devinfo::PropType::Boolean => PropVal::Boolean,
-                        t => PropVal::Unknown(t),
-                    }
-                },
-            );
-        }
-
+        let props = build_prop_tree(pw);
         if let Some(PropVal::Boolean) = props.get("root-hub") {
             buses.push(BusInfo {
                 driver: n.driver_name(),
@@ -105,29 +111,11 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
         devinfo::DevLinks::new(false).map_err(|_| Error::new(ErrorKind::Other, "dev links err"))?;
 
     while let Some(n) = w.next().transpose().unwrap() {
-        let mut pw = n.props();
-        let mut props = HashMap::new();
+        let pw = n.props();
+        let props = build_prop_tree(pw);
         let path = n
             .devfs_path()
             .map_err(|_| Error::new(ErrorKind::Other, "devfs path err"))?;
-
-        while let Some(p) = pw.next().transpose().unwrap() {
-            props.insert(
-                p.name(),
-                if let Some(val) = p.as_i64() {
-                    PropVal::Integer(val)
-                } else if let Some(val) = p.as_bytes() {
-                    PropVal::Bytes(val.to_vec())
-                } else if let Some(val) = p.to_str() {
-                    PropVal::String(val)
-                } else {
-                    match p.value_type() {
-                        devinfo::PropType::Boolean => PropVal::Boolean,
-                        t => PropVal::Unknown(t),
-                    }
-                },
-            );
-        }
 
         if let Some(PropVal::Boolean) = props.get("root-hub") {
             bus = match bus {
@@ -147,7 +135,7 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
 
         let depth = n.depth();
 
-        while !hubs.is_empty() && hubs[hubs.len() - 1].depth >= depth {
+        while hubs.last().is_some_and(|l| l.depth >= depth) {
             hubs.pop();
         }
 
@@ -186,9 +174,8 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
             let mut ports = hubs.iter().map(|h| h.port).collect::<Vec<_>>();
             ports.push(port);
 
-            let busnum = match bus {
-                Some(bus) => bus,
-                None => return Err(Error::new(ErrorKind::Other, "no root port")),
+            let Some(busnum) = bus else {
+                return Err(Error::new(ErrorKind::Other, "no root port"));
             };
 
             if let Some(d) = DeviceDescriptor::new(b) {
@@ -267,7 +254,6 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
                     class: d.class(),
                     subclass: d.subclass(),
                     protocol: d.protocol(),
-                    //max_packet_size_0: d.max_packet_size_0(),
                     speed: None,
                     manufacturer_string,
                     product_string,

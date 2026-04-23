@@ -459,7 +459,12 @@ impl IllumosDevice {
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
         // It doesn't look like libusb does this either since the model
         // of how ugen works doesn't match this
-        Blocking::new(move || Err(Error::new(ErrorKind::Unsupported, "set_configuration not supported")))
+        Blocking::new(move || {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "set_configuration not supported",
+            ))
+        })
     }
 
     pub(crate) fn reset(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
@@ -604,7 +609,12 @@ impl IllumosInterface {
         _alt_setting: u8,
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
         // doesn't work exactly the same here
-        Blocking::new(move || Err(Error::new(ErrorKind::Unsupported, "set_alt_setting not supported")))
+        Blocking::new(move || {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "set_alt_setting not supported",
+            ))
+        })
     }
 
     pub fn get_alt_setting(&self) -> u8 {
