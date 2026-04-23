@@ -194,7 +194,6 @@ impl AsRef<Notify> for EndpointInner {
 struct RawEndpoint {
     interface_number: u8,
     address: u8,
-    #[allow(dead_code)]
     transfer_type: TransferType,
     direction: Direction,
 }
