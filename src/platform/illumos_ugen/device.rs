@@ -225,23 +225,29 @@ impl RawEndpoint {
     }
 }
 
-//#[derive(Debug)]
 pub(crate) struct IllumosDevice {
     fd: OwnedFd,
     stat_fd: OwnedFd,
-    device_descriptor: Vec<u8>,
+    device_descriptor: DeviceDescriptor,
     config_descriptors: Vec<u8>,
     active_config: u8,
     paths: DevfsPath,
     interfaces: HashMap<u8, Vec<RawEndpoint>>,
 }
 
+// This is needed for full enumeration because the strings are needed
+// for probe-rs to work
 pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> {
     let mut result = get_raw(
         fd,
         DescriptorType::String { index },
         crate::descriptors::language_id::US_ENGLISH,
     )?;
+
+    // This was a very sad string descriptor
+    if result.is_empty() {
+        return Err(Error::new(ErrorKind::Other, "empty string descriptor"));
+    }
 
     result.truncate(result[0].into());
     Ok(result)
@@ -264,19 +270,26 @@ fn get_raw(fd: &OwnedFd, descriptor_type: DescriptorType, index: u16) -> Result<
         length: USB_CFG_DESCR_SIZE,
     };
 
-    io::write(fd, control.setup_packet().as_slice()).unwrap();
+    io::write(fd, control.setup_packet().as_slice())
+        .map_err(|e| Error::new_os(ErrorKind::Other, "failed to write", e))?;
 
     let mut buf = [0u8; USB_CFG_DESCR_SIZE as usize];
-    io::read(fd, &mut buf).unwrap();
+    io::read(fd, &mut buf).map_err(|e| Error::new_os(ErrorKind::Other, "failed to read", e))?;
 
-    let total = u16::from_le_bytes(buf[2..4].try_into().unwrap());
+    let total = u16::from_le_bytes(
+        buf[2..4]
+            .try_into()
+            .map_err(|_| Error::new(ErrorKind::Other, "total descriptor length out of bounds"))?,
+    );
     control.length = total;
     control.index = index;
 
-    io::write(fd, control.setup_packet().as_slice()).unwrap();
+    io::write(fd, control.setup_packet().as_slice())
+        .map_err(|e| Error::new_os(ErrorKind::Other, "failed to write", e))?;
 
     let mut descriptors = vec![0u8; total as usize];
-    io::read(fd, &mut descriptors).unwrap();
+    io::read(fd, &mut descriptors)
+        .map_err(|e| Error::new_os(ErrorKind::Other, "failed to read", e))?;
 
     Ok(descriptors)
 }
@@ -293,9 +306,9 @@ fn get_configuration(fd: &OwnedFd) -> Result<u8, Error> {
 
     let mut buf = [0u8];
 
-    // XXX
-    io::write(fd, control.setup_packet().as_slice()).unwrap();
-    io::read(fd, &mut buf).unwrap();
+    io::write(fd, control.setup_packet().as_slice())
+        .map_err(|e| Error::new_os(ErrorKind::Other, "failed to write", e))?;
+    io::read(fd, &mut buf).map_err(|e| Error::new_os(ErrorKind::Other, "failed to read", e))?;
 
     Ok(buf[0])
 }
@@ -356,7 +369,9 @@ impl IllumosDevice {
                         .log_debug()
                     })?;
 
-            let device_descriptor = get_descriptor(&fd, DescriptorType::Device)?;
+            let device_descriptor =
+                DeviceDescriptor::new(&get_descriptor(&fd, DescriptorType::Device)?)
+                    .ok_or(Error::new(ErrorKind::Other, "Invalid device descriptor"))?;
             let active_config = get_configuration(&fd)?;
 
             #[rustfmt::skip]
@@ -364,7 +379,8 @@ impl IllumosDevice {
                 &fd, DescriptorType::Configuration { index: 0 },
             )?;
 
-            let c = ConfigurationDescriptor::new(&config_descriptors).unwrap();
+            let c = ConfigurationDescriptor::new(&config_descriptors)
+                .ok_or(Error::new(ErrorKind::Other, "Invalid config desc"))?;
 
             let interfaces = c
                 .interfaces()
@@ -399,7 +415,7 @@ impl IllumosDevice {
     }
 
     pub(crate) fn device_descriptor(&self) -> DeviceDescriptor {
-        DeviceDescriptor::new(&self.device_descriptor).unwrap()
+        self.device_descriptor.clone()
     }
 
     pub(crate) fn control_in(
@@ -608,18 +624,20 @@ impl IllumosInterface {
         if state.endpoints.is_set(address) {
             return Err(Error::new(ErrorKind::Busy, "endpoint already in use").log_error());
         }
-        // This should have fewer unwraps
         let raw = self
             .device
             .interfaces
             .get(&self.interface_number)
-            .unwrap()
+            .ok_or(Error::new(ErrorKind::Other, "invalid interface number"))?
             .iter()
             .find(|x| x.address == address && x.transfer_type == ep_type)
-            .unwrap();
+            .ok_or(Error::new(ErrorKind::Other, "couldn't find the endpoint"))?;
 
         state.endpoints.set(address);
-        let fds = self.fds.get(&address).unwrap();
+        let fds = self
+            .fds
+            .get(&address)
+            .ok_or(Error::new(ErrorKind::Other, "couldn't find ep address"))?;
         Ok(IllumosEndpoint {
             inner: Arc::new(EndpointInner {
                 raw: raw.clone(),
@@ -638,9 +656,6 @@ impl IllumosInterface {
 
 impl Drop for IllumosInterface {
     fn drop(&mut self) {
-        //
-        // Nothing for the moment -- but this will need to unregister our
-        // FDs from our event port
-        //
+        // Nothing right now
     }
 }
