@@ -545,6 +545,8 @@ impl IllumosDevice {
 
         pending.transfer(&self.fd, &self.stat_fd);
 
+        // SAFETY: this is a blocking transfer and we're all done with
+        // getting anything from the kernel
         unsafe {
             notify_completion::<TransferData>(pending.as_ptr());
         }
@@ -571,8 +573,6 @@ struct InterfaceState {
     alt_setting: u8,
     endpoints: EndpointBitSet,
 }
-
-unsafe impl Sync for IllumosInterface {}
 
 struct IllumosUsbFds {
     fd: Arc<OwnedFd>,
