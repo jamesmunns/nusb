@@ -201,7 +201,6 @@ pub mod transfer;
     target_os = "linux",
     target_os = "macos",
     target_os = "windows",
-    target_os = "illumos"
 ))]
 pub mod hotplug;
 
@@ -304,7 +303,6 @@ pub fn list_buses() -> impl MaybeFuture<Output = Result<impl Iterator<Item = Bus
     target_os = "linux",
     target_os = "macos",
     target_os = "windows",
-    target_os = "illumos"
 ))]
 pub fn watch_devices() -> Result<hotplug::HotplugWatch, Error> {
     Ok(hotplug::HotplugWatch(platform::HotplugWatch::new()?))

@@ -11,9 +11,6 @@ pub(crate) use device::IllumosDevice as Device;
 pub(crate) use device::IllumosEndpoint as Endpoint;
 pub(crate) use device::IllumosInterface as Interface;
 
-mod hotplug;
-pub(crate) use hotplug::IllumosHotplugWatch as HotplugWatch;
-
 use crate::transfer::TransferError;
 
 pub type DeviceId = u64;
