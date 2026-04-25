@@ -197,8 +197,7 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         // The handling here is a mess because if `aio_error` is 0 this should
         // always return something non-zero. This means the unwrap should
         // be fine
-        0 => Ok(unsafe { libc::aio_return(alias.aiocb).try_into().unwrap() }),
-        // Once again, the ugen man page says to check this only if the return
+        0 => Ok(unsafe { libc::aio_return(alias.aiocb).try_into().unwrap() }), // Once again, the ugen man page says to check this only if the return
         // is -1
         n => {
             if n == -1 {
@@ -222,6 +221,10 @@ extern "C" fn aio_callback(arg: libc::sigval) {
     };
 
     unsafe {
+        // we are done with our callback let it be dropped and catch
+        // bad usage
+        let ptr = Box::from_raw(alias.aiocb);
+        (*alias).aiocb = std::ptr::null_mut();
         (*alias).status = Some(status);
         notify_completion::<TransferData>(alias)
     }
@@ -267,13 +270,13 @@ unsafe fn do_aio_transfer(
 
     // We are done. The assumption is we will only use this transfer request once
     let mut aiocb_init = aiocb.assume_init();
-    alias.aiocb = aiocb_init.as_mut();
 
     let result = match dir {
         InternalDir::In => libc::aio_read(aiocb_init.as_mut()),
         InternalDir::Out => libc::aio_write(aiocb_init.as_mut()),
     };
 
+    alias.aiocb = Box::leak(aiocb_init);
     // aio failed, just notify the completion now
     // The status will be updated in the callback for other cases
     if result < 0 {
