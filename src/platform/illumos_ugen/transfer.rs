@@ -1,4 +1,5 @@
 use crate::platform::illumos_ugen::{errno_to_transfer_error, ugen_to_transfer_error};
+use crate::transfer::internal::Idle;
 use crate::transfer::internal::Pending;
 use crate::transfer::{
     internal::notify_completion, Buffer, Completion, ControlIn, ControlOut, TransferError,
@@ -8,7 +9,9 @@ use core::mem::MaybeUninit;
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::io;
 use rustix::io::Errno;
+use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 // We have two possible cases for transfer errors: the raw read/write
 // failed OR the read/write succeded and the stat fd returned an error.
@@ -28,8 +31,14 @@ impl UsbResult {
     }
 }
 
+/// TransferData is held in various nusb containers like `Idle<P>` and
+/// `Pending<P>`, and is a little tricky to work with because it contains
+/// data that is shared between "userspace" and the AIO callback machinery.
+///
+/// When you directly own a `TransferData`, you are free to assume it is
+/// NOT aliased, however if you access it via the `ptr` methods of (TODO)
 pub struct TransferData {
-    pub(crate) status: Option<Result<usize, UsbResult>>,
+    status: UnsafeCell<Option<Result<usize, UsbResult>>>,
     transfer: Option<TransferParts>,
 
     // TODO(AJM): We *might* want to make this a `Box<UnsafeCell<aiocb>>` instead
@@ -37,8 +46,9 @@ pub struct TransferData {
     // explicitly aliasing access between the aio kernel actions and userspace.
     // I want to audit this a bit more, we might leave the ptr as-is, and slap
     // the unsafecell on access.
-    aiocb: *mut libc::aiocb,
+    aiocb: AtomicPtr<libc::aiocb>,
     // We need this for aio error handling via the raw fd
+    raw_fd: i32,
     raw_stat_fd: i32,
 }
 
@@ -96,78 +106,50 @@ impl BlockingTransferData {
         stat_fd: &OwnedFd,
     ) -> Result<usize, UsbResult> {
         let Self { kind, buffer } = self;
-        let buflen = buffer.len as usize;
-
         match kind {
-            BlockingTransferType::ControlOut => {
-                // SAFETY: this is reconstructing the buffer because rustix takes a slice
-                // (as opposed to most platform APIs which do *magic* on the pointer
-                let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buflen) };
-
-                handle_errno_result(io::write(fd, buf), stat_fd)
-            }
+            BlockingTransferType::ControlOut => handle_errno_result(io::write(fd, buffer), stat_fd),
             BlockingTransferType::ControlIn { data_in_len } => {
-                let status = {
-                    // SAFETY: this is reconstructing the buffer because rustix takes a slice
-                    // (as opposed to most platform APIs which do *magic* on the pointer
-                    let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buflen) };
-
-                    handle_errno_result(io::write(fd, buf), stat_fd)
-                };
+                let status = handle_errno_result(io::write(fd, buffer), stat_fd);
                 if status.is_err() {
                     return status;
                 }
                 let dil = *data_in_len as usize;
-                assert!((SETUP_PACKET_SIZE + dil) <= buflen);
-
-                // SAFETY: same logic applies, this is our buffer we have constructed
-
-                let buffer = unsafe {
-                    let start = buffer.ptr.add(SETUP_PACKET_SIZE);
-                    std::slice::from_raw_parts_mut(start, dil)
-                };
-                handle_errno_result(io::read(fd, buffer), stat_fd)
+                handle_errno_result(
+                    io::read(
+                        fd,
+                        &mut buffer[SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + dil)],
+                    ),
+                    stat_fd,
+                )
             }
         }
     }
 }
 
-impl TransferData {
-    pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
-        let buffer = ManuallyDrop::new(buffer);
-        TransferData {
-            transfer: Some(TransferParts {
-                kind: AioTransferType::BulkIn,
-                buffer,
-            }),
-            status: None,
-            aiocb: std::ptr::null_mut(),
-            raw_stat_fd: -1,
-        }
+impl Idle<TransferData> {
+    // pub(super) fn status(&self) -> &Option<Result<usize, UsbResult>> {
+    //     todo!()
+    // }
+
+    pub(super) fn status_mut(&mut self) -> &mut Option<Result<usize, UsbResult>> {
+        // SAFETY: In Idle, there is no aliasing, and it is acceptable to get a
+        // mutable reference to the status field
+        self.status.get_mut()
     }
 
-    pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
-        let buffer = ManuallyDrop::new(buffer);
-        TransferData {
-            transfer: Some(TransferParts {
-                kind: AioTransferType::BulkOut,
-                buffer,
-            }),
-            status: None,
-            aiocb: std::ptr::null_mut(),
-            raw_stat_fd: -1,
-        }
-    }
-
+    // TODO: This probably should be `take_completion(self)`, but that would
+    // require `Idle::<P>::into_inner() -> P`. Our TransferData is relatively
+    // cheap: it's really just the box we keep it in, so there's less incentive
+    // to keep it, and this would *probably* let us simplify some of the `status`
+    // and `transfer` invariants: they could maybe always be `Some` (and therefore not
+    // an Option at all).
     pub fn take_completion(&mut self) -> Completion {
-        let (len, status) = match self.status.unwrap() {
+        let (len, status) = match self.status_mut().take().unwrap() {
             Ok(len) => (len, Ok(())),
             Err(err) => (0, Err(err.to_transfer_error())),
         };
-
-        self.status = None;
-        let transfer = self.transfer.take().expect("should have transfer here");
-        let TransferParts { kind, buffer } = transfer;
+        let TransferParts { kind, buffer } =
+            self.transfer.take().expect("should have transfer here");
 
         match kind {
             AioTransferType::BulkIn => {
@@ -188,6 +170,36 @@ impl TransferData {
     }
 }
 
+impl TransferData {
+    pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
+        let buffer = ManuallyDrop::new(buffer);
+        TransferData {
+            transfer: Some(TransferParts {
+                kind: AioTransferType::BulkIn,
+                buffer,
+            }),
+            status: UnsafeCell::new(None),
+            aiocb: AtomicPtr::new(std::ptr::null_mut()),
+            raw_stat_fd: -1,
+            raw_fd: -1,
+        }
+    }
+
+    pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
+        let buffer = ManuallyDrop::new(buffer);
+        TransferData {
+            transfer: Some(TransferParts {
+                kind: AioTransferType::BulkOut,
+                buffer,
+            }),
+            status: UnsafeCell::new(None),
+            aiocb: AtomicPtr::new(std::ptr::null_mut()),
+            raw_stat_fd: -1,
+            raw_fd: -1,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum InternalDir {
     In,
@@ -197,14 +209,19 @@ enum InternalDir {
 const USB_LC_STAT_UNSPECIFIED_ERR: u32 = 0xe;
 
 extern "C" fn aio_callback(arg: libc::sigval) {
-    // SAFETY We're back from the kernel and we have ownership again
-    let alias: &mut TransferData = unsafe { &mut *arg.sival_ptr.cast() };
+    // SAFETY: aio callback will ONLY be called when Pending, and we can
+    // always treat TransferData as shared while in the Pending state
+    let alias_ptr = arg.sival_ptr.cast::<TransferData>();
+    let alias = unsafe { &*alias_ptr };
 
-    let status = match unsafe { libc::aio_error(alias.aiocb) } {
+    // TODO: Check non-null?
+    let aiocb_ptr = alias.aiocb.load(Ordering::Acquire);
+
+    let status = match unsafe { libc::aio_error(aiocb_ptr) } {
         // The handling here is a mess because if `aio_error` is 0 this should
         // always return something non-zero. This means the unwrap should
         // be fine
-        0 => Ok(unsafe { libc::aio_return(alias.aiocb).try_into().unwrap() }), // Once again, the ugen man page says to check this only if the return
+        0 => Ok(unsafe { libc::aio_return(aiocb_ptr).try_into().unwrap() }), // Once again, the ugen man page says to check this only if the return
         // is -1
         n => {
             if n == -1 {
@@ -229,11 +246,18 @@ extern "C" fn aio_callback(arg: libc::sigval) {
 
     unsafe {
         // we are done with our callback let it be dropped and catch
-        // bad usage
-        drop(Box::from_raw(alias.aiocb));
-        (*alias).aiocb = std::ptr::null_mut();
-        (*alias).status = Some(status);
-        notify_completion::<TransferData>(alias)
+        // bad usage. Drop self...
+        drop(Box::from_raw(aiocb_ptr));
+
+        // ...set the status, which we are allowed to do in Pending
+        let mut status = Some(status);
+        let cur_stat = &mut *alias.status.get();
+        core::mem::swap(&mut status, cur_stat);
+
+        // And mark the ptr as null to signal that the callback is complete
+        alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
+
+        notify_completion::<TransferData>(alias_ptr)
     }
 }
 
@@ -248,6 +272,7 @@ unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
     };
 
     alias.raw_stat_fd = stat_fd;
+    alias.raw_fd = fd;
 
     // Depending on our direction, get the opcode and relevant "start" function
     type StartFn = unsafe extern "C" fn(*mut libc::aiocb) -> libc::c_int;
@@ -263,7 +288,7 @@ unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
     // request is enqueued/active immediately.
     //
     // TODO: `Box::leak(Box::new(UnsafeCell::new(...)))`?
-    alias.aiocb = Box::leak(Box::new(libc::aiocb {
+    let aiocb_ptr = Box::leak(Box::new(libc::aiocb {
         aio_fildes: fd,
         aio_buf: ptr.cast::<libc::c_void>(),
         aio_nbytes: nbytes,
@@ -300,14 +325,21 @@ unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
     }));
 
     // Trigger the start of the read/write
-    let result = aio_start_func(alias.aiocb);
+    alias.aiocb.store(aiocb_ptr, Ordering::Release);
+    let result = aio_start_func(aiocb_ptr);
 
     // aio failed, just notify the completion now
     // The status will be updated in the callback for other cases
     if result < 0 {
-        alias.status = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
+        let mut res = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
             libc::___errno()
         }))));
+
+        // Safety: Although we are pending, the AIO callback failed, which means
+        // there is no chance of aliasing.
+        let cur_status = unsafe { &mut *alias.status.get() };
+        core::mem::swap(&mut res, cur_status);
+
         notify_completion::<TransferData>(alias)
     }
 }
@@ -338,20 +370,22 @@ fn handle_errno_result(
 
 impl Pending<TransferData> {
     pub(super) fn cancel(&self) {
-        // SAFETY this is slightly unsafe because a transfer may be in flight
-        // but importantly we're not touching the data itself, only getting
-        // the pointer
-        let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
+        // SAFETY: In the Pending state, TransferData is always treated as
+        // aliased, therefore it is valid to take a shared reference.
+        let alias: *const TransferData = self.as_ptr().cast_const();
+        let alias: &TransferData = unsafe { &*alias };
 
-        let aiocb = alias.aiocb;
-
+        let aiocb = alias.aiocb.load(Ordering::Acquire);
         if aiocb.is_null() {
             return;
         }
 
         unsafe {
-            libc::aio_cancel((*aiocb).aio_fildes, aiocb);
+            libc::aio_cancel(alias.raw_fd, aiocb);
         }
+
+        // TODO: do we need to clear aiocb here? Check cancel result? If aiocb
+        // is NOT null, then are WE responsible for the drop?
     }
 
     pub(super) fn raw_transfer(&self, raw_fd: i32, raw_stat_fd: i32) {

@@ -74,8 +74,6 @@ pub(crate) struct IllumosEndpoint {
 
     /// A queue of pending transfers, expected to complete in order
     pending: VecDeque<Pending<super::TransferData>>,
-
-    idle_transfer: Option<Idle<TransferData>>,
 }
 
 impl IllumosEndpoint {
@@ -96,21 +94,19 @@ impl IllumosEndpoint {
     }
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
-        self.idle_transfer.take().unwrap_or_else(|| {
-            Idle::new(
-                self.inner.clone(),
-                match Direction::from_address(self.inner.raw.address) {
-                    Direction::In => super::TransferData::new_bulk_in(buffer),
-                    Direction::Out => super::TransferData::new_bulk_out(buffer),
-                },
-            )
-        })
+        Idle::new(
+            self.inner.clone(),
+            match Direction::from_address(self.inner.raw.address) {
+                Direction::In => super::TransferData::new_bulk_in(buffer),
+                Direction::Out => super::TransferData::new_bulk_out(buffer),
+            },
+        )
     }
 
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
         assert_eq!(error, TransferError::InvalidArgument);
         let mut t = self.make_transfer(buffer);
-        t.status = Some(Err(UsbResult::Errno(Errno::INVAL)));
+        *(t.status_mut()) = Some(Err(UsbResult::Errno(Errno::INVAL)));
         self.pending.push_back(t.simulate_complete());
     }
 
@@ -127,7 +123,6 @@ impl IllumosEndpoint {
         self.inner.notify.subscribe(cx);
         if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
             let completion = transfer.take_completion();
-            self.idle_transfer = Some(transfer);
             Poll::Ready(completion)
         } else {
             Poll::Pending
@@ -138,7 +133,6 @@ impl IllumosEndpoint {
         self.inner.notify.wait_timeout(timeout, || {
             take_completed_from_queue(&mut self.pending).map(|mut transfer| {
                 let completion = transfer.take_completion();
-                self.idle_transfer = Some(transfer);
                 completion
             })
         })
@@ -657,7 +651,6 @@ impl IllumosInterface {
             max_packet_size,
 
             pending: VecDeque::new(),
-            idle_transfer: None,
         })
     }
 }
