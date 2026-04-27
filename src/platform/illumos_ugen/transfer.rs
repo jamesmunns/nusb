@@ -35,17 +35,33 @@ impl UsbResult {
 /// `Pending<P>`, and is a little tricky to work with because it contains
 /// data that is shared between "userspace" and the AIO callback machinery.
 ///
-/// When you directly own a `TransferData`, you are free to assume it is
-/// NOT aliased, however if you access it via the `ptr` methods of (TODO)
+/// SAFETY: You should treat `TransferData` as follows:
+///
+/// * When directly owned, or via an authentic `&mut` reference: You have
+///   complete control! Not shared at all.
+/// * When accessed via `Idle<TransferData>`: This only occurs when the
+///   Rust code has exclusive access, and therefore again, you are able to
+///   do whatever you'd like. Not shared at all.
+/// * When accessed via `*mut Pending<TransferData>`, the rules depend on
+///   who "you" are:
+///     * When you are the callback, e.g. `aio_callback`, you may READ all
+///       fields, essentially `&TransferData`. You also have authority to
+///       WRITE `status`. This ability persists until `aiocb` is written
+///       to `null_mut`, signifying that the callback is complete. When the
+///       callback has finished executing, it is responsible for de-allocating
+///       the pointee of `aiocb`.
+///     * When you are NOT the callback, including any `drop` impls or other
+///       polling code, you MUST NOT access `status` until AFTER `aiocb` is
+///       `null_mut`.
+///
+/// TODO(AJM): Make sure aiocb always gets deallocated, even in weird edge cases,
+/// AND probably also add some asserts that aiocb is null_mut where appropriate.
 pub struct TransferData {
     status: UnsafeCell<Option<Result<usize, UsbResult>>>,
     transfer: Option<TransferParts>,
 
-    // TODO(AJM): We *might* want to make this a `Box<UnsafeCell<aiocb>>` instead
-    // of a `Box<aiocb>`, as the latter enforces uniqueness, but we're really
-    // explicitly aliasing access between the aio kernel actions and userspace.
-    // I want to audit this a bit more, we might leave the ptr as-is, and slap
-    // the unsafecell on access.
+    /// A pointer to an aiocb structure, set to null_mut when no outstanding
+    /// callback/syscall is live. See the struct docs for details.
     aiocb: AtomicPtr<libc::aiocb>,
     // We need this for aio error handling via the raw fd
     raw_fd: i32,
@@ -127,10 +143,6 @@ impl BlockingTransferData {
 }
 
 impl Idle<TransferData> {
-    // pub(super) fn status(&self) -> &Option<Result<usize, UsbResult>> {
-    //     todo!()
-    // }
-
     pub(super) fn status_mut(&mut self) -> &mut Option<Result<usize, UsbResult>> {
         // SAFETY: In Idle, there is no aliasing, and it is acceptable to get a
         // mutable reference to the status field
@@ -204,8 +216,14 @@ impl Idle<TransferData> {
             // request is enqueued/active immediately.
             let aiocb_ptr = Box::leak(Box::new(libc::aiocb {
                 aio_fildes: fd,
+
+                // TODO(AJM): I haven't properly documented that `buffer` is aliased
+                // under this model, and I need to audit that it's appropriate to do this
+                // without an additional UnsafeCell like we do with status. This will
+                // be written into by the kernel, prior to the callback being called!
                 aio_buf: ptr.cast::<libc::c_void>(),
                 aio_nbytes: nbytes,
+
                 // We're always at offset zero
                 aio_offset: 0,
                 // Default is fine
@@ -223,8 +241,9 @@ impl Idle<TransferData> {
                     sig_e.sigev_signo = 0;
                     sig_e.ss_sp = aio_callback as *mut libc::c_void;
                     sig_e.sigev_value = libc::sigval {
-                        // Note: Fill in later!
-                        // sival_ptr: alias as *mut TransferData as *mut libc::c_void,
+                        // Note: Fill in later! See the note in the unsafe block below
+                        // for why we DON'T just make this:
+                        // `sival_ptr: alias as *mut TransferData as *mut libc::c_void`
                         sival_ptr: std::ptr::null_mut(),
                     };
                     sig_e.sigev_notify_attributes = std::ptr::null();
@@ -253,6 +272,16 @@ impl Idle<TransferData> {
         // despite being in the pending state.
         let result = unsafe {
             // We can modify the contents of the aiocb as we have not launched it yet
+            //
+            // We are SPECIFICALLY writing this with `platform_ptr` AFTER we have moved to the
+            // Pending state, for provenance reasons. `Pending::as_ptr()` gives us a pointer
+            // to `TransferData`, but with the provenance of `TransferInner`. Since `notify_completion`
+            // casts this pointer BACK to `TransferInner`, calling it with a pointer with ONLY
+            // the `TransferData` as provenance is *technically* incorrect, at least under stacked
+            // borrows (it might be allowed in the tree borrow model, I am unsure).
+            //
+            // This is all just James being overly pedantic, but it doesn't harm anything in
+            // practice.
             (&raw mut aiocb_ptr.aio_sigevent.sigev_value.sival_ptr)
                 .write(platform_ptr as *mut libc::c_void);
             // We can modify the contents of the platform ptr as we have not launched the AIO yet
@@ -337,9 +366,9 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         // The handling here is a mess because if `aio_error` is 0 this should
         // always return something non-zero. This means the unwrap should
         // be fine
-        //
-        // Once again, the ugen man page says to check this only if the return
         0 => Ok(unsafe { libc::aio_return(aiocb_ptr).try_into().unwrap() }),
+
+        // Once again, the ugen man page says to check this only if the return
         // is -1
         -1 => {
             let mut stat: [u8; 4] = [0; 4];
@@ -356,6 +385,7 @@ extern "C" fn aio_callback(arg: libc::sigval) {
                 Err(errno) => Err(UsbResult::Errno(errno)),
             }
         }
+
         other => Err(UsbResult::Errno(Errno::from_raw_os_error(other))),
     };
 
