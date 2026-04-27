@@ -30,7 +30,7 @@ impl UsbResult {
 
 pub struct TransferData {
     pub(crate) status: Option<Result<usize, UsbResult>>,
-    transfer: Option<TransferType>,
+    transfer: Option<TransferParts>,
     aiocb: *mut libc::aiocb,
     // We need this for aio error handling via the raw fd
     raw_stat_fd: i32,
@@ -39,40 +39,38 @@ pub struct TransferData {
 unsafe impl Send for TransferData {}
 unsafe impl Sync for TransferData {}
 
+struct TransferParts {
+    kind: TransferType,
+    buffer: ManuallyDrop<Buffer>,
+}
+
 enum TransferType {
-    ControlOut {
-        buffer: ManuallyDrop<Buffer>,
-    },
+    ControlOut,
     ControlIn {
-        buffer: ManuallyDrop<Buffer>,
         // This is the length we want to read
         data_in_len: u32,
     },
-    BulkIn {
-        buffer: ManuallyDrop<Buffer>,
-    },
-    BulkOut {
-        buffer: ManuallyDrop<Buffer>,
-    },
+    BulkIn,
+    BulkOut,
 }
 
-impl TransferType {
-    fn control_in_data(&self, len: usize) -> Result<&[u8], TransferError> {
-        let TransferType::ControlIn { buffer, .. } = self else {
-            panic!("state machine error, this is not control in");
-        };
-        // This case should be in practice impossible because `len` is the
-        // result that we read out. We could attempt to bubble up an error
-        // but `TransferError` doesn't have a way to do internal error at
-        // the moment
-        if len >= buffer.len() {
-            panic!("internal error {} is greater than {}", len, buffer.len());
-        }
-        // SAFETY this is what was construted and previously passed to the kernel
-        // to read out
-        Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len) })
-    }
-}
+// impl TransferType {
+//     fn control_in_data(&self, len: usize) -> Result<&[u8], TransferError> {
+//         let TransferType::ControlIn { .. } = self else {
+//             panic!("state machine error, this is not control in");
+//         };
+//         // This case should be in practice impossible because `len` is the
+//         // result that we read out. We could attempt to bubble up an error
+//         // but `TransferError` doesn't have a way to do internal error at
+//         // the moment
+//         if len >= buffer.len() {
+//             panic!("internal error {} is greater than {}", len, buffer.len());
+//         }
+//         // SAFETY this is what was construted and previously passed to the kernel
+//         // to read out
+//         Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len) })
+//     }
+// }
 
 impl TransferData {
     pub(super) fn new_control_out(data: ControlOut) -> TransferData {
@@ -81,7 +79,10 @@ impl TransferData {
         buffer.extend_from_slice(data.data);
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::ControlOut { buffer }),
+            transfer: Some(TransferParts {
+                kind: TransferType::ControlOut,
+                buffer,
+            }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -93,9 +94,11 @@ impl TransferData {
         buffer.extend_from_slice(&data.setup_packet());
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::ControlIn {
+            transfer: Some(TransferParts {
+                kind: TransferType::ControlIn {
+                    data_in_len: data.length as u32,
+                },
                 buffer,
-                data_in_len: data.length as u32,
             }),
             status: None,
             aiocb: std::ptr::null_mut(),
@@ -106,7 +109,10 @@ impl TransferData {
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::BulkIn { buffer }),
+            transfer: Some(TransferParts {
+                kind: TransferType::BulkIn,
+                buffer,
+            }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -116,7 +122,10 @@ impl TransferData {
     pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferType::BulkOut { buffer }),
+            transfer: Some(TransferParts {
+                kind: TransferType::BulkOut,
+                buffer,
+            }),
             status: None,
             aiocb: std::ptr::null_mut(),
             raw_stat_fd: -1,
@@ -124,11 +133,12 @@ impl TransferData {
     }
 
     pub fn control_in_status(&self) -> Result<&[u8], TransferError> {
-        match (&self.status, &self.transfer) {
-            (None, _) | (_, None) => panic!("internal state machine error"),
-            (Some(Ok(len)), Some(t)) => t.control_in_data(*len),
-            (Some(Err(e)), _) => Err(e.to_transfer_error()),
-        }
+        todo!("AJM")
+        // match (&self.status, &self.transfer) {
+        //     (None, _) | (_, None) => panic!("internal state machine error"),
+        //     (Some(Ok(len)), Some(t)) => t.control_in_data(*len),
+        //     (Some(Err(e)), _) => Err(e.to_transfer_error()),
+        // }
     }
 
     pub fn status(&self) -> Result<(), TransferError> {
@@ -146,23 +156,21 @@ impl TransferData {
         };
 
         self.status = None;
-        let transfer = self.transfer.take();
+        let transfer = self.transfer.take().expect("should have transfer here");
+        let TransferParts { kind, buffer } = transfer;
 
-        match transfer {
-            Some(TransferType::ControlOut { buffer }) => Completion {
+        match kind {
+            TransferType::ControlOut => Completion {
                 status,
                 actual_len: len as usize,
                 buffer: ManuallyDrop::into_inner(buffer),
             },
-            Some(TransferType::ControlIn {
-                buffer,
-                data_in_len: _,
-            }) => Completion {
+            TransferType::ControlIn { data_in_len: _ } => Completion {
                 status,
                 actual_len: len,
                 buffer: ManuallyDrop::into_inner(buffer),
             },
-            Some(TransferType::BulkIn { buffer }) => {
+            TransferType::BulkIn => {
                 let mut buffer = ManuallyDrop::into_inner(buffer);
                 buffer.len = len as u32;
                 Completion {
@@ -171,12 +179,11 @@ impl TransferData {
                     buffer,
                 }
             }
-            Some(TransferType::BulkOut { buffer }) => Completion {
+            TransferType::BulkOut => Completion {
                 status,
                 actual_len: len,
                 buffer: ManuallyDrop::into_inner(buffer),
             },
-            None => panic!("state machine error"),
         }
     }
 }
@@ -223,21 +230,24 @@ extern "C" fn aio_callback(arg: libc::sigval) {
     unsafe {
         // we are done with our callback let it be dropped and catch
         // bad usage
-        let ptr = Box::from_raw(alias.aiocb);
+        drop(Box::from_raw(alias.aiocb));
         (*alias).aiocb = std::ptr::null_mut();
         (*alias).status = Some(status);
         notify_completion::<TransferData>(alias)
     }
 }
 
-unsafe fn do_aio_transfer(
-    fd: i32,
-    stat_fd: i32,
-    alias: &mut TransferData,
-    aio_buf: *mut u8,
-    aio_nbytes: libc::size_t,
-    dir: InternalDir,
-) {
+unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
+    let (ptr, nbytes, dir) = {
+        let xfer = alias.transfer.as_ref().unwrap();
+        let TransferParts { kind, buffer } = xfer;
+        match kind {
+            TransferType::BulkIn => (buffer.ptr, buffer.requested_len as usize, InternalDir::In),
+            TransferType::BulkOut => (buffer.ptr, buffer.len as usize, InternalDir::Out),
+            _ => panic!(),
+        }
+    };
+
     // `aiocb` has private padding fields so MaybeUninit::zeroed is the
     // cleanest way to model this structure.
     // in the future it would be nifty to just use
@@ -249,12 +259,12 @@ unsafe fn do_aio_transfer(
 
     // https://doc.rust-lang.org/stable/core/mem/union.MaybeUninit.html#initializing-a-struct-field-by-field
     (&raw mut (*aiocb_ptr).aio_fildes).write(fd);
-    (&raw mut (*aiocb_ptr).aio_buf).write(aio_buf.cast::<libc::c_void>());
+    (&raw mut (*aiocb_ptr).aio_buf).write(ptr.cast::<libc::c_void>());
     (&raw mut (*aiocb_ptr).aio_lio_opcode).write(match dir {
         InternalDir::In => libc::LIO_READ,
         InternalDir::Out => libc::LIO_WRITE,
     });
-    (&raw mut (*aiocb_ptr).aio_nbytes).write(aio_nbytes);
+    (&raw mut (*aiocb_ptr).aio_nbytes).write(nbytes);
     // We're always at offset zero
     (&raw mut (*aiocb_ptr).aio_offset).write(0);
     // Default is fine
@@ -333,29 +343,8 @@ impl Pending<TransferData> {
         // SAFETY We're taking full ownership of this to do the transfer
         let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
-        match &alias.transfer {
-            Some(TransferType::BulkIn { buffer }) => unsafe {
-                do_aio_transfer(
-                    raw_fd,
-                    raw_stat_fd,
-                    alias,
-                    buffer.ptr,
-                    buffer.requested_len as usize,
-                    InternalDir::In,
-                );
-            },
-            Some(TransferType::BulkOut { buffer }) => unsafe {
-                do_aio_transfer(
-                    raw_fd,
-                    raw_stat_fd,
-                    alias,
-                    buffer.ptr,
-                    buffer.len as usize,
-                    InternalDir::Out,
-                );
-            },
-
-            _ => panic!("ugh"),
+        unsafe {
+            do_aio_transfer(raw_fd, raw_stat_fd, alias);
         }
     }
 
@@ -363,9 +352,12 @@ impl Pending<TransferData> {
         // SAFETY We're taking full ownership of this to do the transfer
         let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
 
-        //match unsafe { &(*alias).transfer } {
-        match &alias.transfer {
-            Some(TransferType::ControlOut { buffer }) => {
+        let Some(TransferParts { kind, buffer }) = alias.transfer.as_mut() else {
+            panic!("state machine error");
+        };
+
+        match kind {
+            TransferType::ControlOut => {
                 // SAFETY: this is reconstructing the buffer because rustix takes a slice
                 // (as opposed to most platform APIs which do *magic* on the pointer
                 let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
@@ -373,10 +365,7 @@ impl Pending<TransferData> {
                 let status = handle_errno_result(io::write(fd, buf), stat_fd);
                 alias.status = Some(status);
             }
-            Some(TransferType::ControlIn {
-                buffer,
-                data_in_len,
-            }) => {
+            TransferType::ControlIn { data_in_len } => {
                 // SAFETY: this is reconstructing the buffer because rustix takes a slice
                 // (as opposed to most platform APIs which do *magic* on the pointer
                 let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
@@ -397,7 +386,7 @@ impl Pending<TransferData> {
                 let status = handle_errno_result(io::read(fd, buffer), stat_fd);
                 alias.status = Some(status);
             }
-            None | Some(_) => {
+            _ => {
                 panic!("state machine error");
             }
         }
@@ -409,20 +398,9 @@ impl Drop for TransferData {
         // self.aiocb should get automatically dropped
 
         // If the completion was called this will be `None`
-        match self.transfer.take() {
-            Some(TransferType::ControlIn { buffer, .. }) => {
-                drop(ManuallyDrop::into_inner(buffer));
-            }
-            Some(TransferType::ControlOut { buffer }) => {
-                drop(ManuallyDrop::into_inner(buffer));
-            }
-            Some(TransferType::BulkIn { buffer }) => {
-                drop(ManuallyDrop::into_inner(buffer));
-            }
-            Some(TransferType::BulkOut { buffer }) => {
-                drop(ManuallyDrop::into_inner(buffer));
-            }
-            None => {}
-        }
+        let Some(transfer) = self.transfer.take() else {
+            return;
+        };
+        drop(ManuallyDrop::into_inner(transfer.buffer));
     }
 }
