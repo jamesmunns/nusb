@@ -111,10 +111,9 @@ impl IllumosEndpoint {
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
-        let t = self.make_transfer(buffer);
-        let pending = t.pre_submit();
+        let idle = self.make_transfer(buffer);
 
-        pending.raw_transfer(self.inner.fd.as_raw_fd(), self.inner.stat_fd.as_raw_fd());
+        let pending = idle.raw_transfer(self.inner.fd.as_raw_fd(), self.inner.stat_fd.as_raw_fd());
 
         self.pending.push_back(pending);
     }
@@ -423,7 +422,8 @@ impl IllumosDevice {
                     // TODO(AJM): Is this:
                     // 1. `SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + n)`, OR
                     // 2. `SETUP_PACKET_SIZE..n`?
-                    let Some(read) = t.buffer.get(SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + n)) else {
+                    let Some(read) = t.buffer.get(SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + n))
+                    else {
                         panic!()
                     };
                     Ok(read.to_owned())
@@ -439,11 +439,9 @@ impl IllumosDevice {
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
         let mut t = BlockingTransferData::new_control_out(data);
-        Blocking::new(move || {
-            match t.blocking_transfer(&self.fd, &self.stat_fd) {
-                Ok(_n) => Ok(()),
-                Err(e) => Err(e.to_transfer_error()),
-            }
+        Blocking::new(move || match t.blocking_transfer(&self.fd, &self.stat_fd) {
+            Ok(_n) => Ok(()),
+            Err(e) => Err(e.to_transfer_error()),
         })
     }
 

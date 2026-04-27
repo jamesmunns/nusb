@@ -168,6 +168,122 @@ impl Idle<TransferData> {
             },
         }
     }
+
+    pub(super) fn raw_transfer(mut self, fd: i32, stat_fd: i32) -> Pending<TransferData> {
+        //
+        // At the start, we are in the idle state, and have exclusive access.
+        //
+        let (aiocb_ptr, aio_start_func) = {
+            let idle: &mut TransferData = &mut self;
+
+            let (ptr, nbytes, dir) = {
+                let xfer = idle.transfer.as_ref().unwrap();
+                let TransferParts { kind, buffer } = xfer;
+                match kind {
+                    AioTransferType::BulkIn => {
+                        (buffer.ptr, buffer.requested_len as usize, InternalDir::In)
+                    }
+                    AioTransferType::BulkOut => (buffer.ptr, buffer.len as usize, InternalDir::Out),
+                }
+            };
+
+            idle.raw_stat_fd = stat_fd;
+            idle.raw_fd = fd;
+
+            // Depending on our direction, get the opcode and relevant "start" function
+            type StartFn = unsafe extern "C" fn(*mut libc::aiocb) -> libc::c_int;
+            let (opcode, aio_start_func): (libc::c_int, StartFn) = match dir {
+                InternalDir::In => (libc::LIO_READ, libc::aio_read),
+                InternalDir::Out => (libc::LIO_WRITE, libc::aio_write),
+            };
+
+            // Create our aiocb structure.
+            // The assumption is we will only use this transfer request once.
+            //
+            // Store the aiocb ptr prior to calling the read/write function, as the
+            // request is enqueued/active immediately.
+            let aiocb_ptr = Box::leak(Box::new(libc::aiocb {
+                aio_fildes: fd,
+                aio_buf: ptr.cast::<libc::c_void>(),
+                aio_nbytes: nbytes,
+                // We're always at offset zero
+                aio_offset: 0,
+                // Default is fine
+                aio_reqprio: 0,
+                aio_sigevent: {
+                    // SAFETY: `sigevent` has private padding fields, however the type itself has
+                    // no particular runtime invariants, and we are about to initalize all
+                    // visible fields before use. As this is a C-oriented structure, zero-initialization
+                    // of all fields is appropriate here.
+                    let mut sig_e =
+                        unsafe { MaybeUninit::<libc::sigevent>::zeroed().assume_init() };
+
+                    sig_e.sigev_notify = libc::SIGEV_THREAD;
+                    // This is not used, here for clarity
+                    sig_e.sigev_signo = 0;
+                    sig_e.ss_sp = aio_callback as *mut libc::c_void;
+                    sig_e.sigev_value = libc::sigval {
+                        // Note: Fill in later!
+                        // sival_ptr: alias as *mut TransferData as *mut libc::c_void,
+                        sival_ptr: std::ptr::null_mut(),
+                    };
+                    sig_e.sigev_notify_attributes = std::ptr::null();
+                    sig_e
+                },
+
+                aio_lio_opcode: opcode,
+
+                aio_resultp: libc::aio_result_t {
+                    aio_return: 0,
+                    aio_errno: 0,
+                },
+                aio_state: 0,
+                aio__pad: [0; _],
+            }));
+            (aiocb_ptr, aio_start_func)
+        };
+
+        // END OF IDLE PHASE!
+        //
+        // BEGIN PENDING PHASE!
+        let pending = self.pre_submit();
+        let platform_ptr = pending.as_ptr();
+
+        // SAFETY: We have NOT started the aio transfer yet, we are allowed to poke shared things
+        // despite being in the pending state.
+        let result = unsafe {
+            // We can modify the contents of the aiocb as we have not launched it yet
+            (&raw mut aiocb_ptr.aio_sigevent.sigev_value.sival_ptr)
+                .write(platform_ptr as *mut libc::c_void);
+            // We can modify the contents of the platform ptr as we have not launched the AIO yet
+            (*platform_ptr).aiocb.store(aiocb_ptr, Ordering::Release);
+            // Here we go!
+            aio_start_func(aiocb_ptr)
+        };
+
+        // aio failed, just notify the completion now
+        // The status will be updated in the callback for other cases
+        if result < 0 {
+            // Safety: Although we are pending, the AIO callback failed, which means
+            // there is no chance of aliasing. Okay to take exclusive access.
+            unsafe {
+                // Get error
+                let mut res = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(
+                    *libc::___errno(),
+                ))));
+
+                let alias = &mut *platform_ptr;
+                let cur_status = &mut *alias.status.get();
+                core::mem::swap(&mut res, cur_status);
+
+                // Notify that the transfer is now complete (by way of error)
+                notify_completion::<TransferData>(platform_ptr);
+            }
+        }
+
+        // Return our transfer which is now in the pending state
+        pending
+    }
 }
 
 impl TransferData {
@@ -210,7 +326,7 @@ const USB_LC_STAT_UNSPECIFIED_ERR: u32 = 0xe;
 
 extern "C" fn aio_callback(arg: libc::sigval) {
     // SAFETY: aio callback will ONLY be called when Pending, and we can
-    // always treat TransferData as shared while in the Pending state
+    // always treat TransferData as shared while in the Pending state.
     let alias_ptr = arg.sival_ptr.cast::<TransferData>();
     let alias = unsafe { &*alias_ptr };
 
@@ -221,27 +337,26 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         // The handling here is a mess because if `aio_error` is 0 this should
         // always return something non-zero. This means the unwrap should
         // be fine
-        0 => Ok(unsafe { libc::aio_return(aiocb_ptr).try_into().unwrap() }), // Once again, the ugen man page says to check this only if the return
+        //
+        // Once again, the ugen man page says to check this only if the return
+        0 => Ok(unsafe { libc::aio_return(aiocb_ptr).try_into().unwrap() }),
         // is -1
-        n => {
-            if n == -1 {
-                let mut stat: [u8; 4] = [0; 4];
-                match io::read(
-                    // SAFETY we expect the stat fd to still be alive at this point
-                    // and we stored it explicitly
-                    unsafe { BorrowedFd::borrow_raw(alias.raw_stat_fd) },
-                    &mut stat,
-                ) {
-                    Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
-                    // man page example just returns the unspecified error
-                    Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
-                    // Return this errno?
-                    Err(errno) => Err(UsbResult::Errno(errno)),
-                }
-            } else {
-                Err(UsbResult::Errno(Errno::from_raw_os_error(n)))
+        -1 => {
+            let mut stat: [u8; 4] = [0; 4];
+            match io::read(
+                // SAFETY we expect the stat fd to still be alive at this point
+                // and we stored it explicitly
+                unsafe { BorrowedFd::borrow_raw(alias.raw_stat_fd) },
+                &mut stat,
+            ) {
+                Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
+                // man page example just returns the unspecified error
+                Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
+                // Return this errno?
+                Err(errno) => Err(UsbResult::Errno(errno)),
             }
         }
+        other => Err(UsbResult::Errno(Errno::from_raw_os_error(other))),
     };
 
     unsafe {
@@ -249,7 +364,7 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         // bad usage. Drop self...
         drop(Box::from_raw(aiocb_ptr));
 
-        // ...set the status, which we are allowed to do in Pending
+        // ...set the status, which we (the callback!) are allowed to do in Pending
         let mut status = Some(status);
         let cur_stat = &mut *alias.status.get();
         core::mem::swap(&mut status, cur_stat);
@@ -258,89 +373,6 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
 
         notify_completion::<TransferData>(alias_ptr)
-    }
-}
-
-unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
-    let (ptr, nbytes, dir) = {
-        let xfer = alias.transfer.as_ref().unwrap();
-        let TransferParts { kind, buffer } = xfer;
-        match kind {
-            AioTransferType::BulkIn => (buffer.ptr, buffer.requested_len as usize, InternalDir::In),
-            AioTransferType::BulkOut => (buffer.ptr, buffer.len as usize, InternalDir::Out),
-        }
-    };
-
-    alias.raw_stat_fd = stat_fd;
-    alias.raw_fd = fd;
-
-    // Depending on our direction, get the opcode and relevant "start" function
-    type StartFn = unsafe extern "C" fn(*mut libc::aiocb) -> libc::c_int;
-    let (opcode, aio_start_func): (libc::c_int, StartFn) = match dir {
-        InternalDir::In => (libc::LIO_READ, libc::aio_read),
-        InternalDir::Out => (libc::LIO_WRITE, libc::aio_write),
-    };
-
-    // Create our aiocb structure.
-    // The assumption is we will only use this transfer request once.
-    //
-    // Store the aiocb ptr prior to calling the read/write function, as the
-    // request is enqueued/active immediately.
-    //
-    // TODO: `Box::leak(Box::new(UnsafeCell::new(...)))`?
-    let aiocb_ptr = Box::leak(Box::new(libc::aiocb {
-        aio_fildes: fd,
-        aio_buf: ptr.cast::<libc::c_void>(),
-        aio_nbytes: nbytes,
-        // We're always at offset zero
-        aio_offset: 0,
-        // Default is fine
-        aio_reqprio: 0,
-        aio_sigevent: {
-            // SAFETY: `sigevent` has private padding fields, however the type itself has
-            // no particular runtime invariants, and we are about to initalize all
-            // visible fields before use. As this is a C-oriented structure, zero-initialization
-            // of all fields is appropriate here.
-            let mut sig_e = unsafe { MaybeUninit::<libc::sigevent>::zeroed().assume_init() };
-
-            sig_e.sigev_notify = libc::SIGEV_THREAD;
-            // This is not used, here for clarity
-            sig_e.sigev_signo = 0;
-            sig_e.ss_sp = aio_callback as *mut libc::c_void;
-            sig_e.sigev_value = libc::sigval {
-                sival_ptr: alias as *mut TransferData as *mut libc::c_void,
-            };
-            sig_e.sigev_notify_attributes = std::ptr::null();
-            sig_e
-        },
-
-        aio_lio_opcode: opcode,
-
-        aio_resultp: libc::aio_result_t {
-            aio_return: 0,
-            aio_errno: 0,
-        },
-        aio_state: 0,
-        aio__pad: [0; _],
-    }));
-
-    // Trigger the start of the read/write
-    alias.aiocb.store(aiocb_ptr, Ordering::Release);
-    let result = aio_start_func(aiocb_ptr);
-
-    // aio failed, just notify the completion now
-    // The status will be updated in the callback for other cases
-    if result < 0 {
-        let mut res = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(*unsafe {
-            libc::___errno()
-        }))));
-
-        // Safety: Although we are pending, the AIO callback failed, which means
-        // there is no chance of aliasing.
-        let cur_status = unsafe { &mut *alias.status.get() };
-        core::mem::swap(&mut res, cur_status);
-
-        notify_completion::<TransferData>(alias)
     }
 }
 
@@ -386,15 +418,6 @@ impl Pending<TransferData> {
 
         // TODO: do we need to clear aiocb here? Check cancel result? If aiocb
         // is NOT null, then are WE responsible for the drop?
-    }
-
-    pub(super) fn raw_transfer(&self, raw_fd: i32, raw_stat_fd: i32) {
-        // SAFETY We're taking full ownership of this to do the transfer
-        let alias: &mut TransferData = unsafe { &mut *self.as_ptr() };
-
-        unsafe {
-            do_aio_transfer(raw_fd, raw_stat_fd, alias);
-        }
     }
 }
 
