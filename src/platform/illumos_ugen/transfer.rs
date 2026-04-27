@@ -31,6 +31,12 @@ impl UsbResult {
 pub struct TransferData {
     pub(crate) status: Option<Result<usize, UsbResult>>,
     transfer: Option<TransferParts>,
+
+    // TODO(AJM): We *might* want to make this a `Box<UnsafeCell<aiocb>>` instead
+    // of a `Box<aiocb>`, as the latter enforces uniqueness, but we're really
+    // explicitly aliasing access between the aio kernel actions and userspace.
+    // I want to audit this a bit more, we might leave the ptr as-is, and slap
+    // the unsafecell on access.
     aiocb: *mut libc::aiocb,
     // We need this for aio error handling via the raw fd
     raw_stat_fd: i32,
@@ -248,45 +254,61 @@ unsafe fn do_aio_transfer(fd: i32, stat_fd: i32, alias: &mut TransferData) {
         }
     };
 
-    // `aiocb` has private padding fields so MaybeUninit::zeroed is the
-    // cleanest way to model this structure.
-    // in the future it would be nifty to just use
-    // Box::<libc::aiocb>::new_zeroed()
-    let mut aiocb = Box::new(MaybeUninit::<libc::aiocb>::zeroed());
-    let aiocb_ptr = aiocb.as_mut_ptr();
-
     alias.raw_stat_fd = stat_fd;
 
-    // https://doc.rust-lang.org/stable/core/mem/union.MaybeUninit.html#initializing-a-struct-field-by-field
-    (&raw mut (*aiocb_ptr).aio_fildes).write(fd);
-    (&raw mut (*aiocb_ptr).aio_buf).write(ptr.cast::<libc::c_void>());
-    (&raw mut (*aiocb_ptr).aio_lio_opcode).write(match dir {
-        InternalDir::In => libc::LIO_READ,
-        InternalDir::Out => libc::LIO_WRITE,
-    });
-    (&raw mut (*aiocb_ptr).aio_nbytes).write(nbytes);
-    // We're always at offset zero
-    (&raw mut (*aiocb_ptr).aio_offset).write(0);
-    // Default is fine
-    (&raw mut (*aiocb_ptr).aio_reqprio).write(0);
-    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_notify).write(libc::SIGEV_THREAD);
-    // This is not used, here for clarity
-    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_signo).write(0);
-    (&raw mut (*aiocb_ptr).aio_sigevent.ss_sp).write(aio_callback as *mut libc::c_void);
-    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_value).write(libc::sigval {
-        sival_ptr: alias as *mut TransferData as *mut libc::c_void,
-    });
-    (&raw mut (*aiocb_ptr).aio_sigevent.sigev_notify_attributes).write(std::ptr::null());
-
-    // We are done. The assumption is we will only use this transfer request once
-    let mut aiocb_init = aiocb.assume_init();
-
-    let result = match dir {
-        InternalDir::In => libc::aio_read(aiocb_init.as_mut()),
-        InternalDir::Out => libc::aio_write(aiocb_init.as_mut()),
+    // Depending on our direction, get the opcode and relevant "start" function
+    type StartFn = unsafe extern "C" fn(*mut libc::aiocb) -> libc::c_int;
+    let (opcode, aio_start_func): (libc::c_int, StartFn) = match dir {
+        InternalDir::In => (libc::LIO_READ, libc::aio_read),
+        InternalDir::Out => (libc::LIO_WRITE, libc::aio_write),
     };
 
-    alias.aiocb = Box::leak(aiocb_init);
+    // Create our aiocb structure.
+    // The assumption is we will only use this transfer request once.
+    //
+    // Store the aiocb ptr prior to calling the read/write function, as the
+    // request is enqueued/active immediately.
+    //
+    // TODO: `Box::leak(Box::new(UnsafeCell::new(...)))`?
+    alias.aiocb = Box::leak(Box::new(libc::aiocb {
+        aio_fildes: fd,
+        aio_buf: ptr.cast::<libc::c_void>(),
+        aio_nbytes: nbytes,
+        // We're always at offset zero
+        aio_offset: 0,
+        // Default is fine
+        aio_reqprio: 0,
+        aio_sigevent: {
+            // SAFETY: `sigevent` has private padding fields, however the type itself has
+            // no particular runtime invariants, and we are about to initalize all
+            // visible fields before use. As this is a C-oriented structure, zero-initialization
+            // of all fields is appropriate here.
+            let mut sig_e = unsafe { MaybeUninit::<libc::sigevent>::zeroed().assume_init() };
+
+            sig_e.sigev_notify = libc::SIGEV_THREAD;
+            // This is not used, here for clarity
+            sig_e.sigev_signo = 0;
+            sig_e.ss_sp = aio_callback as *mut libc::c_void;
+            sig_e.sigev_value = libc::sigval {
+                sival_ptr: alias as *mut TransferData as *mut libc::c_void,
+            };
+            sig_e.sigev_notify_attributes = std::ptr::null();
+            sig_e
+        },
+
+        aio_lio_opcode: opcode,
+
+        aio_resultp: libc::aio_result_t {
+            aio_return: 0,
+            aio_errno: 0,
+        },
+        aio_state: 0,
+        aio__pad: [0; _],
+    }));
+
+    // Trigger the start of the read/write
+    let result = aio_start_func(alias.aiocb);
+
     // aio failed, just notify the completion now
     // The status will be updated in the callback for other cases
     if result < 0 {
