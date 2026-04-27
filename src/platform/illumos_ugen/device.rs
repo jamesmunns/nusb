@@ -11,9 +11,7 @@ use crate::platform::illumos_ugen::transfer::{BlockingTransferData, UsbResult};
 use crate::platform::illumos_ugen::Errno;
 use crate::platform::TransferData;
 use crate::transfer::{
-    internal::{
-        notify_completion, take_completed_from_queue, Idle, Notify, Pending, TransferFuture,
-    },
+    internal::{take_completed_from_queue, Idle, Notify, Pending},
     Buffer, Completion, ControlIn, ControlOut, ControlType, Direction, Recipient, TransferError,
 };
 use crate::ErrorKind;
@@ -423,10 +421,21 @@ impl IllumosDevice {
         data: ControlIn,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let t = BlockingTransferData::new_control_in(data);
-        TransferFuture::new(t, |t| self.blocking_submit(t)).map(move |t| {
-            drop(self);
-            t.control_in_status().map(|m| m.to_owned())
+        let mut t = BlockingTransferData::new_control_in(data);
+        Blocking::new(move || {
+            match t.blocking_transfer(&self.fd, &self.stat_fd) {
+                Ok(n) => {
+                    use crate::transfer::SETUP_PACKET_SIZE;
+                    // TODO(AJM): Is this:
+                    // 1. `SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + n)`, OR
+                    // 2. `SETUP_PACKET_SIZE..n`?
+                    let Some(read) = t.buffer.get(SETUP_PACKET_SIZE..(SETUP_PACKET_SIZE + n)) else {
+                        panic!()
+                    };
+                    Ok(read.to_owned())
+                }
+                Err(e) => Err(e.to_transfer_error()),
+            }
         })
     }
 
@@ -435,10 +444,12 @@ impl IllumosDevice {
         data: ControlOut,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let t = BlockingTransferData::new_control_out(data);
-        TransferFuture::new(t, |t| self.blocking_submit(t)).map(move |t| {
-            drop(self);
-            t.status()
+        let mut t = BlockingTransferData::new_control_out(data);
+        Blocking::new(move || {
+            match t.blocking_transfer(&self.fd, &self.stat_fd) {
+                Ok(_n) => Ok(()),
+                Err(e) => Err(e.to_transfer_error()),
+            }
         })
     }
 
@@ -539,19 +550,6 @@ impl IllumosDevice {
                 state: Mutex::new(InterfaceState::default()),
             }))
         })
-    }
-
-    pub(crate) fn blocking_submit(&self, transfer: Idle<BlockingTransferData>) -> Pending<BlockingTransferData> {
-        let pending = transfer.pre_submit();
-
-        pending.transfer(&self.fd, &self.stat_fd);
-
-        // SAFETY: this is a blocking transfer and we're all done with
-        // getting anything from the kernel
-        unsafe {
-            notify_completion::<BlockingTransferData>(pending.as_ptr());
-        }
-        pending
     }
 
     #[allow(unused)]

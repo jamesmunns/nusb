@@ -20,7 +20,7 @@ pub(crate) enum UsbResult {
 }
 
 impl UsbResult {
-    fn to_transfer_error(self) -> TransferError {
+    pub(crate) fn to_transfer_error(self) -> TransferError {
         match self {
             UsbResult::Errno(e) => errno_to_transfer_error(e),
             UsbResult::UgenStat(e) => ugen_to_transfer_error(e),
@@ -45,31 +45,13 @@ pub struct TransferData {
 unsafe impl Send for TransferData {}
 unsafe impl Sync for TransferData {}
 
-
 pub struct BlockingTransferData {
-    pub(crate) status: Option<Result<usize, UsbResult>>,
-    transfer: Option<BlockingTransferParts>,
-
-    // TODO(AJM): We *might* want to make this a `Box<UnsafeCell<aiocb>>` instead
-    // of a `Box<aiocb>`, as the latter enforces uniqueness, but we're really
-    // explicitly aliasing access between the aio kernel actions and userspace.
-    // I want to audit this a bit more, we might leave the ptr as-is, and slap
-    // the unsafecell on access.
-    // aiocb: *mut libc::aiocb,
-    // We need this for aio error handling via the raw fd
-    // raw_stat_fd: i32,
+    kind: BlockingTransferType,
+    pub(super) buffer: Buffer,
 }
-
-unsafe impl Send for BlockingTransferData {}
-unsafe impl Sync for BlockingTransferData {}
 
 struct TransferParts {
     kind: AioTransferType,
-    buffer: ManuallyDrop<Buffer>,
-}
-
-struct BlockingTransferParts {
-    kind: BlockingTransferType,
     buffer: ManuallyDrop<Buffer>,
 }
 
@@ -91,158 +73,66 @@ impl BlockingTransferData {
         let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.data.len()).unwrap());
         buffer.extend_from_slice(&data.setup_packet());
         buffer.extend_from_slice(data.data);
-        let buffer = ManuallyDrop::new(buffer);
         BlockingTransferData {
-            transfer: Some(BlockingTransferParts {
-                kind: BlockingTransferType::ControlOut,
-                buffer,
-            }),
-            status: None,
+            kind: BlockingTransferType::ControlOut,
+            buffer,
         }
     }
 
     pub(super) fn new_control_in(data: ControlIn) -> BlockingTransferData {
         let mut buffer = Buffer::new(SETUP_PACKET_SIZE.checked_add(data.length as usize).unwrap());
         buffer.extend_from_slice(&data.setup_packet());
-        let buffer = ManuallyDrop::new(buffer);
         BlockingTransferData {
-            transfer: Some(BlockingTransferParts {
-                kind: BlockingTransferType::ControlIn {
-                    data_in_len: data.length as u32,
-                },
-                buffer,
-            }),
-            status: None,
+            kind: BlockingTransferType::ControlIn {
+                data_in_len: data.length as u32,
+            },
+            buffer,
         }
     }
 
-    // pub fn take_completion(&mut self) -> Completion {
-    //     let (len, status) = match self.status.unwrap() {
-    //         Ok(len) => (len, Ok(())),
-    //         Err(err) => (0, Err(err.to_transfer_error())),
-    //     };
-
-    //     self.status = None;
-    //     let transfer = self.transfer.take().expect("should have transfer here");
-    //     let BlockingTransferParts { kind, buffer } = transfer;
-
-    //     match kind {
-    //         BlockingTransferType::ControlOut => Completion {
-    //             status,
-    //             actual_len: len as usize,
-    //             buffer: ManuallyDrop::into_inner(buffer),
-    //         },
-    //         BlockingTransferType::ControlIn { data_in_len: _ } => Completion {
-    //             status,
-    //             actual_len: len,
-    //             buffer: ManuallyDrop::into_inner(buffer),
-    //         },
-    //     }
-    // }
-
-    pub fn status(&self) -> Result<(), TransferError> {
-        match &self.status {
-            None => Ok(()),
-            Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => Err(e.to_transfer_error()),
-        }
-    }
-
-    pub fn control_in_status(&self) -> Result<&[u8], TransferError> {
-        match (&self.status, &self.transfer) {
-            (None, _) | (_, None) => panic!("internal state machine error"),
-            (Some(Ok(_len)), Some(t)) => {
-                let _ = t.buffer;
-                // t.control_in_data(*len),
-                // let TransferType::ControlIn { .. } = self else {
-                //     panic!("state machine error, this is not control in");
-                // };
-                // // This case should be in practice impossible because `len` is the
-                // // result that we read out. We could attempt to bubble up an error
-                // // but `TransferError` doesn't have a way to do internal error at
-                // // the moment
-                // if len >= buffer.len() {
-                //     panic!("internal error {} is greater than {}", len, buffer.len());
-                // }
-                // // SAFETY this is what was construted and previously passed to the kernel
-                // // to read out
-                // Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len) })
-                todo!()
-            }
-            (Some(Err(e)), _) => Err(e.to_transfer_error()),
-        }
-    }
-}
-
-impl Pending<BlockingTransferData> {
-    pub(super) fn transfer(&self, fd: &OwnedFd, stat_fd: &OwnedFd) {
-        // SAFETY We're taking full ownership of this to do the transfer
-        let alias: &mut BlockingTransferData = unsafe { &mut *self.as_ptr() };
-
-        let Some(BlockingTransferParts { kind, buffer }) = alias.transfer.as_mut() else {
-            panic!("state machine error");
-        };
+    pub(super) fn blocking_transfer(
+        &mut self,
+        fd: &OwnedFd,
+        stat_fd: &OwnedFd,
+    ) -> Result<usize, UsbResult> {
+        let Self { kind, buffer } = self;
+        let buflen = buffer.len as usize;
 
         match kind {
             BlockingTransferType::ControlOut => {
                 // SAFETY: this is reconstructing the buffer because rustix takes a slice
                 // (as opposed to most platform APIs which do *magic* on the pointer
-                let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
+                let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buflen) };
 
-                let status = handle_errno_result(io::write(fd, buf), stat_fd);
-                alias.status = Some(status);
+                handle_errno_result(io::write(fd, buf), stat_fd)
             }
             BlockingTransferType::ControlIn { data_in_len } => {
                 let status = {
                     // SAFETY: this is reconstructing the buffer because rustix takes a slice
                     // (as opposed to most platform APIs which do *magic* on the pointer
-                    let buf =
-                        unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len as usize) };
+                    let buf = unsafe { std::slice::from_raw_parts(buffer.ptr, buflen) };
 
                     handle_errno_result(io::write(fd, buf), stat_fd)
                 };
                 if status.is_err() {
-                    alias.status = Some(status);
-                    return;
+                    return status;
                 }
+                let dil = *data_in_len as usize;
+                assert!((SETUP_PACKET_SIZE + dil) <= buflen);
 
-                let status = {
-                    // SAFETY: same logic applies, this is our buffer we have constructed
-                    let buffer = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (*buffer).ptr.add(SETUP_PACKET_SIZE),
-                            *data_in_len as usize,
-                        )
-                    };
-                    handle_errno_result(io::read(fd, buffer), stat_fd)
+                // SAFETY: same logic applies, this is our buffer we have constructed
+
+                let buffer = unsafe {
+                    let start = buffer.ptr.add(SETUP_PACKET_SIZE);
+                    std::slice::from_raw_parts_mut(start, dil)
                 };
-                alias.status = Some(status);
+                handle_errno_result(io::read(fd, buffer), stat_fd)
             }
         }
     }
 }
 
-// impl TransferType {
-//     fn control_in_data(&self, len: usize) -> Result<&[u8], TransferError> {
-//         let TransferType::ControlIn { .. } = self else {
-//             panic!("state machine error, this is not control in");
-//         };
-//         // This case should be in practice impossible because `len` is the
-//         // result that we read out. We could attempt to bubble up an error
-//         // but `TransferError` doesn't have a way to do internal error at
-//         // the moment
-//         if len >= buffer.len() {
-//             panic!("internal error {} is greater than {}", len, buffer.len());
-//         }
-//         // SAFETY this is what was construted and previously passed to the kernel
-//         // to read out
-//         Ok(unsafe { std::slice::from_raw_parts(buffer.ptr.add(SETUP_PACKET_SIZE), len) })
-//     }
-// }
-
 impl TransferData {
-
-
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
@@ -472,7 +362,6 @@ impl Pending<TransferData> {
             do_aio_transfer(raw_fd, raw_stat_fd, alias);
         }
     }
-
 }
 
 impl Drop for TransferData {
