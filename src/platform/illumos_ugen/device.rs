@@ -7,7 +7,7 @@ use crate::descriptors::{
     EndpointDescriptor, TransferType,
 };
 use crate::maybe_future::{blocking::Blocking, MaybeFuture};
-use crate::platform::illumos_ugen::transfer::UsbResult;
+use crate::platform::illumos_ugen::transfer::{BlockingTransferData, UsbResult};
 use crate::platform::illumos_ugen::Errno;
 use crate::platform::TransferData;
 use crate::transfer::{
@@ -158,14 +158,15 @@ impl IllumosEndpoint {
 
 impl Drop for IllumosEndpoint {
     fn drop(&mut self) {
-        if !self.pending.is_empty() {
-            debug!(
-                "Dropping endpoint {:02x} with {} pending transfers",
-                self.inner.raw.address,
-                self.pending.len()
-            );
-            self.cancel_all();
+        if self.pending.is_empty() {
+            return;
         }
+        debug!(
+            "Dropping endpoint {:02x} with {} pending transfers",
+            self.inner.raw.address,
+            self.pending.len()
+        );
+        self.cancel_all();
     }
 }
 
@@ -422,8 +423,8 @@ impl IllumosDevice {
         data: ControlIn,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let t = TransferData::new_control_in(data);
-        TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
+        let t = BlockingTransferData::new_control_in(data);
+        TransferFuture::new(t, |t| self.blocking_submit(t)).map(move |t| {
             drop(self);
             t.control_in_status().map(|m| m.to_owned())
         })
@@ -434,8 +435,8 @@ impl IllumosDevice {
         data: ControlOut,
         _timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let t = TransferData::new_control_out(data);
-        TransferFuture::new(t, |t| self.submit(t)).map(move |t| {
+        let t = BlockingTransferData::new_control_out(data);
+        TransferFuture::new(t, |t| self.blocking_submit(t)).map(move |t| {
             drop(self);
             t.status()
         })
@@ -540,7 +541,7 @@ impl IllumosDevice {
         })
     }
 
-    pub(crate) fn submit(&self, transfer: Idle<TransferData>) -> Pending<TransferData> {
+    pub(crate) fn blocking_submit(&self, transfer: Idle<BlockingTransferData>) -> Pending<BlockingTransferData> {
         let pending = transfer.pre_submit();
 
         pending.transfer(&self.fd, &self.stat_fd);
@@ -548,7 +549,7 @@ impl IllumosDevice {
         // SAFETY: this is a blocking transfer and we're all done with
         // getting anything from the kernel
         unsafe {
-            notify_completion::<TransferData>(pending.as_ptr());
+            notify_completion::<BlockingTransferData>(pending.as_ptr());
         }
         pending
     }
