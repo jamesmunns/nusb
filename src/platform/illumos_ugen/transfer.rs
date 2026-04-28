@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 pub(crate) enum UsbResult {
     Errno(Errno),
     UgenStat(u32),
+    Cancelled,
 }
 
 impl UsbResult {
@@ -27,8 +28,24 @@ impl UsbResult {
         match self {
             UsbResult::Errno(e) => errno_to_transfer_error(e),
             UsbResult::UgenStat(e) => ugen_to_transfer_error(e),
+            UsbResult::Cancelled => TransferError::Cancelled,
         }
     }
+}
+
+type AioTransferStatus = Option<Result<usize, UsbResult>>;
+
+/// SAFETY: This is used to statically assert that the `status` field of
+/// `TransferData` is Copy, and therefore has no load bearing drop. This
+/// is so we don't need to explicitly worry about dropping any old status
+/// when setting the status after a transfer has been completed.
+#[allow(dead_code)]
+mod hidden {
+    const fn assert_copy<T: Copy>(t: &T) -> T {
+        *t
+    }
+
+    pub const _STATUS_COPY: super::AioTransferStatus = const { assert_copy(&None) };
 }
 
 /// TransferData is held in various nusb containers like `Idle<P>` and
@@ -54,42 +71,82 @@ impl UsbResult {
 ///       polling code, you MUST NOT access `status` until AFTER `aiocb` is
 ///       `null_mut`.
 ///
-/// TODO(AJM): Make sure aiocb always gets deallocated, even in weird edge cases,
-/// AND probably also add some asserts that aiocb is null_mut where appropriate.
-pub struct TransferData {
-    status: UnsafeCell<Option<Result<usize, UsbResult>>>,
-    transfer: Option<TransferParts>,
+/// It is the responsibility of whoever sets `aiocb` back to null to properly
+/// drop/free the pointee. In the happy path, this is done on completion of the
+/// AIO callback. When the AIO transfer fails to be started, this is done immediately.
+pub(crate) struct TransferData {
+    /// Status of the transfer. `None` when the transfer has not been completed,
+    /// or after the completion has already been taken. `Some` when the transfer
+    /// has been completed either by the AIO callback, or on some more immediate
+    /// error case.
+    ///
+    /// This field is an `UnsafeCell` as it may be written through an aliased
+    /// shared reference/pointer to `TransferData` when in the `Pending` state.
+    ///
+    /// SAFETY: See struct documentation for sharing rules. The contents of this
+    /// UnsafeCell MUST be Copy/MUST NOT have a Drop impl, unless we update the
+    /// code to properly drop the previous contents when setting.
+    status: UnsafeCell<AioTransferStatus>,
+
+    /// Information about the transfer, including the type of transfer and
+    /// relevant buffer. Set to Some on creation, and set to None when
+    /// the completion is taken.
+    transfer: Option<AioTransferParts>,
 
     /// A pointer to an aiocb structure, set to null_mut when no outstanding
     /// callback/syscall is live. See the struct docs for details.
     aiocb: AtomicPtr<libc::aiocb>,
-    // We need this for aio error handling via the raw fd
+
+    // We need these for aio error handling via the raw fd. Both are set to
+    // -1 on creation, and set when the transfer is started (moving from the
+    // Idle state to Pending).
     raw_fd: i32,
     raw_stat_fd: i32,
 }
 
+/// SAFETY: TransferData is sometimes shared in the Pending state. Atomic operations
+/// with aiocb are used to mediate shared access and inner mutability. See the struct
+/// docs for TransferData for details on correct usage.
 unsafe impl Send for TransferData {}
+
+/// SAFETY: TransferData is sometimes shared in the Pending state. Atomic operations
+/// with aiocb are used to mediate shared access and inner mutability. See the struct
+/// docs for TransferData for details on correct usage.
 unsafe impl Sync for TransferData {}
 
-pub struct BlockingTransferData {
+/// Transfer data used for blocking syscalls, currently only Control In/Out transfers.
+/// Since this isn't done with AIO, it has no tricky usage requirements like the
+/// main TransferData type.
+pub(crate) struct BlockingTransferData {
     kind: BlockingTransferType,
     pub(super) buffer: Buffer,
 }
 
-struct TransferParts {
+/// Components for an AIO transfer
+struct AioTransferParts {
+    /// The kind of transfer, e.g. Bulk In/Out
     kind: AioTransferType,
+    /// The heap allocated buffer for the transfer
+    ///
+    /// TODO: SAFETY docs??
     buffer: ManuallyDrop<Buffer>,
 }
 
+/// Kinds of AIO transfers
 enum AioTransferType {
+    /// Bulk In Transfer
     BulkIn,
+    /// Bulk Out Transfer
     BulkOut,
 }
 
+/// Kinds of Blocking transfers
 enum BlockingTransferType {
+    /// Control Out transfer
     ControlOut,
+    /// Control In transfer
     ControlIn {
-        // This is the length we want to read
+        /// This is the length we want to read
         data_in_len: u32,
     },
 }
@@ -160,7 +217,7 @@ impl Idle<TransferData> {
             Ok(len) => (len, Ok(())),
             Err(err) => (0, Err(err.to_transfer_error())),
         };
-        let TransferParts { kind, buffer } =
+        let AioTransferParts { kind, buffer } =
             self.transfer.take().expect("should have transfer here");
 
         match kind {
@@ -190,7 +247,7 @@ impl Idle<TransferData> {
 
             let (ptr, nbytes, dir) = {
                 let xfer = idle.transfer.as_ref().unwrap();
-                let TransferParts { kind, buffer } = xfer;
+                let AioTransferParts { kind, buffer } = xfer;
                 match kind {
                     AioTransferType::BulkIn => {
                         (buffer.ptr, buffer.requested_len as usize, InternalDir::In)
@@ -214,7 +271,7 @@ impl Idle<TransferData> {
             //
             // Store the aiocb ptr prior to calling the read/write function, as the
             // request is enqueued/active immediately.
-            let aiocb_ptr = Box::leak(Box::new(libc::aiocb {
+            let aiocb_ptr = Box::into_raw(Box::new(libc::aiocb {
                 aio_fildes: fd,
 
                 // TODO(AJM): I haven't properly documented that `buffer` is aliased
@@ -282,7 +339,7 @@ impl Idle<TransferData> {
             //
             // This is all just James being overly pedantic, but it doesn't harm anything in
             // practice.
-            (&raw mut aiocb_ptr.aio_sigevent.sigev_value.sival_ptr)
+            (&raw mut (*aiocb_ptr).aio_sigevent.sigev_value.sival_ptr)
                 .write(platform_ptr as *mut libc::c_void);
             // We can modify the contents of the platform ptr as we have not launched the AIO yet
             (*platform_ptr).aiocb.store(aiocb_ptr, Ordering::Release);
@@ -297,13 +354,17 @@ impl Idle<TransferData> {
             // there is no chance of aliasing. Okay to take exclusive access.
             unsafe {
                 // Get error
-                let mut res = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(
+                let res = Some(Err(UsbResult::Errno(Errno::from_raw_os_error(
                     *libc::___errno(),
                 ))));
 
                 let alias = &mut *platform_ptr;
-                let cur_status = &mut *alias.status.get();
-                core::mem::swap(&mut res, cur_status);
+                alias.status.get().write(res);
+
+                // Release the aiocb we just created, as it will no longer be used,
+                // and the callback will not perform the regular happy path drop
+                alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
+                let _ = Box::from_raw(aiocb_ptr);
 
                 // Notify that the transfer is now complete (by way of error)
                 notify_completion::<TransferData>(platform_ptr);
@@ -319,7 +380,7 @@ impl TransferData {
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferParts {
+            transfer: Some(AioTransferParts {
                 kind: AioTransferType::BulkIn,
                 buffer,
             }),
@@ -333,7 +394,7 @@ impl TransferData {
     pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
         let buffer = ManuallyDrop::new(buffer);
         TransferData {
-            transfer: Some(TransferParts {
+            transfer: Some(AioTransferParts {
                 kind: AioTransferType::BulkOut,
                 buffer,
             }),
@@ -359,8 +420,12 @@ extern "C" fn aio_callback(arg: libc::sigval) {
     let alias_ptr = arg.sival_ptr.cast::<TransferData>();
     let alias = unsafe { &*alias_ptr };
 
-    // TODO: Check non-null?
     let aiocb_ptr = alias.aiocb.load(Ordering::Acquire);
+    assert_ne!(
+        aiocb_ptr,
+        std::ptr::null_mut(),
+        "aiocb freed without cancelling AIO callback!"
+    );
 
     let status = match unsafe { libc::aio_error(aiocb_ptr) } {
         // The handling here is a mess because if `aio_error` is 0 this should
@@ -395,13 +460,12 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         drop(Box::from_raw(aiocb_ptr));
 
         // ...set the status, which we (the callback!) are allowed to do in Pending
-        let mut status = Some(status);
-        let cur_stat = &mut *alias.status.get();
-        core::mem::swap(&mut status, cur_stat);
+        alias.status.get().write(Some(status));
 
-        // And mark the ptr as null to signal that the callback is complete
+        // Mark the ptr as null to signal that the callback is complete
         alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
 
+        // Notify that this transfer has completed
         notify_completion::<TransferData>(alias_ptr)
     }
 }
@@ -437,23 +501,104 @@ impl Pending<TransferData> {
         let alias: *const TransferData = self.as_ptr().cast_const();
         let alias: &TransferData = unsafe { &*alias };
 
-        let aiocb = alias.aiocb.load(Ordering::Acquire);
-        if aiocb.is_null() {
+        // If the ptr is clear, we assume that things have already completed naturally
+        // via callback, or was cancelled some other way. Don't continue cleaning up.
+        let aiocb_ptr = alias.aiocb.load(Ordering::Acquire);
+        if aiocb_ptr.is_null() {
             return;
         }
 
-        unsafe {
-            libc::aio_cancel(alias.raw_fd, aiocb);
-        }
+        // Ask the OS to cancel our pending AIO request
+        let res = unsafe { libc::aio_cancel(alias.raw_fd, aiocb_ptr) };
 
-        // TODO: do we need to clear aiocb here? Check cancel result? If aiocb
-        // is NOT null, then are WE responsible for the drop?
+        // If it's our job to clean things up, do it with this closure
+        let we_do_cleanup = || {
+            unsafe {
+                alias.status.get().write(Some(Err(UsbResult::Cancelled)));
+                alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
+                let _ = Box::from_raw(aiocb_ptr);
+
+                // TODO: do we need to notify completed? See:
+                // https://github.com/kevinmehall/nusb/issues/197
+            }
+        };
+
+        // RETURN VALUES
+        //     The aio_cancel() function returns the value AIO_CANCELED to the calling
+        //     process if the requested operation(s) were canceled. The value
+        //     AIO_NOTCANCELED is returned if at least one of the requested
+        //     operation(s) cannot be canceled because it is in progress. In this
+        //     case, the state of the other operations, if any, referenced in the call
+        //     to aio_cancel() is not indicated by the return value of aio_cancel().
+        //     The application may determine the state of affairs for these operations
+        //     by using aio_error(3C). The value AIO_ALLDONE is returned if all of the
+        //     operations have already completed. Otherwise, the function returns −1
+        //     and sets errno to indicate the error.
+        match res {
+            libc::AIO_CANCELED => {
+                // We cancelled the request before it ran, so we are responsible for setting
+                // status and freeing the aiocb pointer.
+                we_do_cleanup();
+            }
+            libc::AIO_ALLDONE => {
+                // Okay, this is not great. Our atomic pointer WASN'T Null, but ALSO the
+                // callback wasn't marked as cancelled. Do one quick check JUST IN CASE
+                // there was a race between `aiocb.load` and `aio_cancel`. If the pointer
+                // is NOW null, we just observed a little race, and we can avoid any further
+                // remediation
+                let aiocb_ptr2 = alias.aiocb.load(Ordering::Acquire);
+                if aiocb_ptr2.is_null() {
+                    // Whew. Just a little race. The callback already handled cleanup.
+                    return;
+                }
+
+                // Now we are in the Cool Zone. The transfer is ALLDONE according to the
+                // operating system, but the callback DIDN'T clear the aiocb buffer.
+                // Something has gone seriously wrong, and let's not continue out of
+                // an abundance of caution
+                panic!("Indeterminate outcome reached on cancelling a transfer. This is a program error.");
+            }
+            libc::AIO_NOTCANCELED => {
+                // According to the man page: "At least one of the requests specified was not canceled
+                // because it was in progress."
+                //
+                // Since we only ever queue up single transfers, we probably have to assume our transfer
+                // is currently running, and the callback will be called?
+                //
+                // If this isn't the case, we might need to do better remediation here. Leave a debug log
+                // in case folks need to figure this out in the future
+                log::debug!("Observed AIO_NOTCANCELED while cancelling a request, assuming callback will still execute.");
+            }
+            other => {
+                // ERRORS
+                //     The aio_cancel() function will fail if:
+                //     EBADF
+                //         The fildes argument is not a valid file descriptor.
+                //     ENOSYS
+                //         The aio_cancel() function is not supported.
+                //
+                // Either of these are indicators that things did NOT go well, and we should perform cleanup.
+                // We're not checking errno because we don't *particularly* care why we got here.
+                log::error!(
+                    "Observed unexpected error code {other} while cancelling fd:{}",
+                    alias.raw_fd
+                );
+                we_do_cleanup();
+            }
+        }
     }
 }
 
 impl Drop for TransferData {
     fn drop(&mut self) {
-        // self.aiocb should get automatically dropped
+        // If we are dropping, then aiocb MUST NOT exist, as that would mean that
+        // there is an aiocb with a reference to the TransferData and buffer we are
+        // about to drop.
+        assert_eq!(
+            self.aiocb.load(Ordering::Acquire),
+            std::ptr::null_mut(),
+            "Dropped a TransferData while an aiocb was still live, this is a bug"
+        );
 
         // If the completion was called this will be `None`
         let Some(transfer) = self.transfer.take() else {

@@ -93,7 +93,8 @@ impl IllumosEndpoint {
         }
     }
 
-    fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
+    /// Create a new transfer in the initial Idle state with the given Buffer
+    fn make_aio_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
         Idle::new(
             self.inner.clone(),
             match Direction::from_address(self.inner.raw.address) {
@@ -103,21 +104,24 @@ impl IllumosEndpoint {
         )
     }
 
+    /// Create a new transfer with the given buffer, and immediately mark it as
+    /// errored and complete
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
         assert_eq!(error, TransferError::InvalidArgument);
-        let mut t = self.make_transfer(buffer);
+        let mut t = self.make_aio_transfer(buffer);
         *(t.status_mut()) = Some(Err(UsbResult::Errno(Errno::INVAL)));
         self.pending.push_back(t.simulate_complete());
     }
 
+    /// Create a new transfer with the given buffer, and immediately submit it for
+    /// AIO processing
     pub(crate) fn submit(&mut self, buffer: Buffer) {
-        let idle = self.make_transfer(buffer);
-
+        let idle = self.make_aio_transfer(buffer);
         let pending = idle.raw_transfer(self.inner.fd.as_raw_fd(), self.inner.stat_fd.as_raw_fd());
-
         self.pending.push_back(pending);
     }
 
+    /// Poll for a transfer currently in the Idle+Completed state
     pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
         self.inner.notify.subscribe(cx);
         if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
@@ -128,6 +132,8 @@ impl IllumosEndpoint {
         }
     }
 
+    /// Perform a blocking wait for the next transfer to complete, with the given
+    /// timeout
     pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
         self.inner.notify.wait_timeout(timeout, || {
             take_completed_from_queue(&mut self.pending).map(|mut transfer| {
@@ -409,6 +415,10 @@ impl IllumosDevice {
         self.device_descriptor.clone()
     }
 
+    /// Perform a Control-In transfer with the given data. This transfer
+    /// is performed in a blocking manner, on a background worker thread.
+    ///
+    /// NOTE: `_timeout` is currently not honored!
     pub(crate) fn control_in(
         self: Arc<Self>,
         data: ControlIn,
@@ -433,6 +443,10 @@ impl IllumosDevice {
         })
     }
 
+    /// Perform a Control-Out transfer with the given data. This transfer
+    /// is performed in a blocking manner, on a background worker thread.
+    ///
+    /// NOTE: `_timeout` is currently not honored!
     pub(crate) fn control_out(
         self: Arc<Self>,
         data: ControlOut,
