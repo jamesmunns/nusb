@@ -64,16 +64,31 @@ mod hidden {
 ///     * When you are the callback, e.g. `aio_callback`, you may READ all
 ///       fields, essentially `&TransferData`. You also have authority to
 ///       WRITE `status`. This ability persists until `aiocb` is written
-///       to `null_mut`, signifying that the callback is complete. When the
-///       callback has finished executing, it is responsible for de-allocating
-///       the pointee of `aiocb`.
+///       to `null_mut`, signifying that the callback is complete.
 ///     * When you are NOT the callback, including any `drop` impls or other
 ///       polling code, you MUST NOT access `status` until AFTER `aiocb` is
 ///       `null_mut`.
-///
-/// It is the responsibility of whoever sets `aiocb` back to null to properly
-/// drop/free the pointee. In the happy path, this is done on completion of the
-/// AIO callback. When the AIO transfer fails to be started, this is done immediately.
+/// * When registering an AIO transfer, the state flow of the `aiocb` field
+///   is expected to go:
+///     1. The user code moves the TransferData from Idle to Pending. This
+///        is achieved by calling `Idle::<TransferData>::raw_transfer`.
+///     2. `raw_transfer` allocates an `aiocb` structure, and sets the `aiocb`
+///        field to the allocation pointer.
+///     3. `raw_transfer` then attempts to register the AIO transaction.
+///         * If this *fails*, the user code should immediately set the aiocb
+///           field to null, and de-allocate the allocated aiocb struct. The
+///           nusb machinery is notified, and the transfer is marked as ready
+///           to be moved back to the Idle state. The flow ends here.
+///         * If this continues, the transfer now continues the flow continues.
+///     4. At some later point, `aio_callback` will be called with the pointer
+///        to the `aiocb` struct. Note that the callback is called regardless of
+///        whether the transfer completed (successfully or unsuccessfully), OR
+///        if the transfer was cancelled due to `aio_cancel` being called. The
+///        callback is then responsible for:
+///         * Obtaining the outcome (success or failure, including cancellation)
+///         * Setting the `status` field with that outcome
+///         * AFTER setting the `status`, marking the `aiocb` field back to null
+///         * de-allocating the `aiocb` structure.
 pub(crate) struct TransferData {
     /// Status of the transfer. `None` when the transfer has not been completed,
     /// or after the completion has already been taken. `Some` when the transfer
@@ -424,7 +439,7 @@ extern "C" fn aio_callback(arg: libc::sigval) {
     assert_ne!(
         aiocb_ptr,
         std::ptr::null_mut(),
-        "aiocb freed without cancelling AIO callback!"
+        "aiocb freed before AIO callback executed!"
     );
 
     let status = match unsafe { libc::aio_error(aiocb_ptr) } {
@@ -451,15 +466,18 @@ extern "C" fn aio_callback(arg: libc::sigval) {
             }
         }
 
+        // Other includes ECANCELED, which would occur if the transfer had
+        // been cancelled prior to execution
         other => Err(UsbResult::Errno(Errno::from_raw_os_error(other))),
     };
 
     unsafe {
-        // we are done with our callback let it be dropped and catch
-        // bad usage. Drop self...
+        // we are done with our callback, and we are responsible for freeing the
+        // aiocb we created.
         drop(Box::from_raw(aiocb_ptr));
 
-        // ...set the status, which we (the callback!) are allowed to do in Pending
+        // ...set the status, which we (the callback!) are allowed to do in
+        // the Pending state.
         alias.status.get().write(Some(status));
 
         // Mark the ptr as null to signal that the callback is complete
@@ -509,19 +527,11 @@ impl Pending<TransferData> {
         }
 
         // Ask the OS to cancel our pending AIO request
+        //
+        // Note: This is *asynchronous*, the callback will STILL be called regardless
+        // of calling aio_cancel/what this returns, it'll just notice a failure upon
+        // calling `aio_read` or `aio_error` when it DOES run.
         let res = unsafe { libc::aio_cancel(alias.raw_fd, aiocb_ptr) };
-
-        // If it's our job to clean things up, do it with this closure
-        let we_do_cleanup = || {
-            unsafe {
-                alias.status.get().write(Some(Err(UsbResult::Cancelled)));
-                alias.aiocb.store(std::ptr::null_mut(), Ordering::Release);
-                let _ = Box::from_raw(aiocb_ptr);
-
-                // TODO: do we need to notify completed? See:
-                // https://github.com/kevinmehall/nusb/issues/197
-            }
-        };
 
         // RETURN VALUES
         //     The aio_cancel() function returns the value AIO_CANCELED to the calling
@@ -536,9 +546,9 @@ impl Pending<TransferData> {
         //     and sets errno to indicate the error.
         match res {
             libc::AIO_CANCELED => {
-                // We cancelled the request before it ran, so we are responsible for setting
-                // status and freeing the aiocb pointer.
-                we_do_cleanup();
+                // The request has been cancelled, when the callback is eventually run, it
+                // will do cleanup for us.
+                log::trace!("Successfully cancelled transfer");
             }
             libc::AIO_ALLDONE => {
                 // Okay, this is not great. Our atomic pointer WASN'T Null, but ALSO the
@@ -561,13 +571,7 @@ impl Pending<TransferData> {
             libc::AIO_NOTCANCELED => {
                 // According to the man page: "At least one of the requests specified was not canceled
                 // because it was in progress."
-                //
-                // Since we only ever queue up single transfers, we probably have to assume our transfer
-                // is currently running, and the callback will be called?
-                //
-                // If this isn't the case, we might need to do better remediation here. Leave a debug log
-                // in case folks need to figure this out in the future
-                log::debug!("Observed AIO_NOTCANCELED while cancelling a request, assuming callback will still execute.");
+                log::debug!("Observed AIO_NOTCANCELED while cancelling a transfer, the transfer will still execute.");
             }
             other => {
                 // ERRORS
@@ -580,10 +584,9 @@ impl Pending<TransferData> {
                 // Either of these are indicators that things did NOT go well, and we should perform cleanup.
                 // We're not checking errno because we don't *particularly* care why we got here.
                 log::error!(
-                    "Observed unexpected error code {other} while cancelling fd:{}",
+                    "Observed unexpected return code {other} while cancelling fd:{}",
                     alias.raw_fd
                 );
-                we_do_cleanup();
             }
         }
     }
@@ -591,9 +594,27 @@ impl Pending<TransferData> {
 
 impl Drop for TransferData {
     fn drop(&mut self) {
-        // If we are dropping, then aiocb MUST NOT exist, as that would mean that
+        // If we are dropping, then aiocb MUST NOT be non-null, as that would mean that
         // there is an aiocb with a reference to the TransferData and buffer we are
         // about to drop.
+        //
+        // When TransferData exists as an owned item, or as part of an `Idle<TransferData>`,
+        // it should NEVER have a non-null `aiocb` pointer. This means that if we are dropped
+        // in these states, we should never run afoul of this assert. When a `Pending<TransferData>`
+        // is moved back to an `Idle<TransferData>, it is because the callback has run, and it
+        // was responsible for clearing the `aiocb` pointer. There is no way to return to an
+        // owned `TransferData` from the `Idle` or `Pending` states. Even if a `Pending<TransferData>`
+        // was created, but the transfer failed to be registered: it is the responsibility of
+        // `raw_transfer` to re-clear and de-allocate the `aiocb` field.
+        //
+        // Note that EVEN IF a `Pending<TransferData>` is dropped after a transfer is registered,
+        // the `TransferInner` that contains it is NOT also immediately dropped: it is marked as
+        // "Abandoned", and leaked, and the `TransferData` itself will only be restored and dropped
+        // once `notify_completion` is called, which notices that the `TransferInner` was
+        // abandoned, so drop should now be called.
+        //
+        // This means: if we EVER actually get to dropping the `TransferData` and the
+        // `aiocb` pointer is NOT null: something very bad/unexpected has occurred!
         assert_eq!(
             self.aiocb.load(Ordering::Acquire),
             std::ptr::null_mut(),
