@@ -143,8 +143,26 @@ struct AioTransferParts {
     kind: AioTransferType,
     /// The heap allocated buffer for the transfer
     ///
-    /// TODO: SAFETY docs??
-    buffer: ManuallyDrop<Buffer>,
+    /// NOTE: Although there is never aliased mutation of the *Buffer* itself, the
+    /// pointee of the Buffer, e.g. the payload of the `Vec` that was used to create
+    /// it WILL have aliased access. As `Buffer` implements `Deref`, we place the
+    /// Buffer into an `UnsafeCell` to prevent accidental access while the operating
+    /// system is potentially writing into this buffer.
+    ///
+    /// I'm not sure if this is *exactly* the right way to model this, but I also think
+    /// it is sufficiently conservative. We MAY treat the buffer itself (e.g. ptr and len
+    /// fields) as appropriately shared, however *dereferencing* the `buffer.ptr` field
+    /// should ONLY be done when exclusive access to this field would be appropriate. At
+    /// the moment, this is only done in the owned + Idle states. When moving to the Pending
+    /// state, we only take the `ptr` field and place it in the `aiocb` struct, which grants
+    /// the operating system to access it (and the ptr field should NOT be dereferenced
+    /// for read/write access) UNTIL the callback is called, signifying the end of the OS'
+    /// access to the payload.
+    ///
+    /// Also note: the contents of an `UnsafeCell` are dropped "normally", meaning we do
+    /// not need any manual handling of this in the `Drop` impl of `AioTransferParts` (or
+    /// of the outer `TransferData`).
+    buffer: UnsafeCell<Buffer>,
 }
 
 /// Kinds of AIO transfers
@@ -234,10 +252,9 @@ impl Idle<TransferData> {
         };
         let AioTransferParts { kind, buffer } =
             self.transfer.take().expect("should have transfer here");
-
+        let mut buffer = buffer.into_inner();
         match kind {
             AioTransferType::BulkIn => {
-                let mut buffer = ManuallyDrop::into_inner(buffer);
                 buffer.len = len as u32;
                 Completion {
                     status,
@@ -248,7 +265,7 @@ impl Idle<TransferData> {
             AioTransferType::BulkOut => Completion {
                 status,
                 actual_len: len,
-                buffer: ManuallyDrop::into_inner(buffer),
+                buffer,
             },
         }
     }
@@ -260,9 +277,10 @@ impl Idle<TransferData> {
         let (aiocb_ptr, aio_start_func) = {
             let idle: &mut TransferData = &mut self;
 
-            let (ptr, nbytes, dir) = {
-                let xfer = idle.transfer.as_ref().unwrap();
+            let (buffer_ptr, nbytes, dir) = {
+                let xfer = idle.transfer.as_mut().unwrap();
                 let AioTransferParts { kind, buffer } = xfer;
+                let buffer = buffer.get_mut();
                 match kind {
                     AioTransferType::BulkIn => {
                         (buffer.ptr, buffer.requested_len as usize, InternalDir::In)
@@ -288,12 +306,7 @@ impl Idle<TransferData> {
             // request is enqueued/active immediately.
             let aiocb_ptr = Box::into_raw(Box::new(libc::aiocb {
                 aio_fildes: fd,
-
-                // TODO(AJM): I haven't properly documented that `buffer` is aliased
-                // under this model, and I need to audit that it's appropriate to do this
-                // without an additional UnsafeCell like we do with status. This will
-                // be written into by the kernel, prior to the callback being called!
-                aio_buf: ptr.cast::<libc::c_void>(),
+                aio_buf: buffer_ptr.cast::<libc::c_void>(),
                 aio_nbytes: nbytes,
 
                 // We're always at offset zero
@@ -393,11 +406,10 @@ impl Idle<TransferData> {
 
 impl TransferData {
     pub(super) fn new_bulk_in(buffer: Buffer) -> TransferData {
-        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(AioTransferParts {
                 kind: AioTransferType::BulkIn,
-                buffer,
+                buffer: UnsafeCell::new(buffer),
             }),
             status: UnsafeCell::new(None),
             aiocb: AtomicPtr::new(std::ptr::null_mut()),
@@ -407,11 +419,10 @@ impl TransferData {
     }
 
     pub(super) fn new_bulk_out(buffer: Buffer) -> TransferData {
-        let buffer = ManuallyDrop::new(buffer);
         TransferData {
             transfer: Some(AioTransferParts {
                 kind: AioTransferType::BulkOut,
-                buffer,
+                buffer: UnsafeCell::new(buffer),
             }),
             status: UnsafeCell::new(None),
             aiocb: AtomicPtr::new(std::ptr::null_mut()),
@@ -620,11 +631,5 @@ impl Drop for TransferData {
             std::ptr::null_mut(),
             "Dropped a TransferData while an aiocb was still live, this is a bug"
         );
-
-        // If the completion was called this will be `None`
-        let Some(transfer) = self.transfer.take() else {
-            return;
-        };
-        drop(ManuallyDrop::into_inner(transfer.buffer));
     }
 }
