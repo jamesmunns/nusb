@@ -155,7 +155,10 @@ fn walk_devices() -> Result<impl Iterator<Item = DeviceInfo>, Error> {
 
             let manufacturer_string = match props.get("usb-vendor-name") {
                 Some(PropVal::String(v)) => Some(v.clone()),
-                None => continue,
+                None => {
+                    log::warn!("OOPS: would have ignored device without vendor string");
+                    None
+                }
                 _ => return Err(Error::new(ErrorKind::Other, "bad usb-vendor-name")),
             };
 

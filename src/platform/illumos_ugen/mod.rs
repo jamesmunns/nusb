@@ -29,7 +29,10 @@ fn ugen_to_transfer_error(e: u32) -> TransferError {
         // We really should not get here but `panic` seems harsh....
         0 => TransferError::Unknown(0),
         // #define USB_LC_STAT_CRC                 0x01    /* CRC timeout detected   */
-        1 => TransferError::Cancelled,
+        1 => {
+            log::warn!("OOPS: USB_LC_STAT_CRC, was Cancelled, now Fault");
+            TransferError::Fault
+        }
         // #define USB_LC_STAT_BITSTUFFING         0x02    /* Bit-stuffing violation */
         2 => TransferError::Fault,
         // #define USB_LC_STAT_DATA_TOGGLE_MM      0x03    /* Data toggle mismatch   */
@@ -51,7 +54,10 @@ fn ugen_to_transfer_error(e: u32) -> TransferError {
         // #define USB_LC_STAT_BUFFER_UNDERRUN     0x0b    /* Buffer under run       */
         0xb => TransferError::InvalidArgument,
         // #define USB_LC_STAT_TIMEOUT             0x0c    /* Command timed out      */
-        0xc => TransferError::Cancelled,
+        0xc => {
+            log::warn!("OOPS: USB_LC_STAT_TIMEOUT, was Cancelled, now Fault");
+            TransferError::Fault
+        }
         // #define USB_LC_STAT_NOT_ACCESSED        0x0d    /* Not accessed by h/w    */
         0xd => TransferError::InvalidArgument,
         // #define USB_LC_STAT_UNSPECIFIED_ERR     0x0e    /* Unspecified error      */
@@ -86,6 +92,7 @@ fn ugen_to_transfer_error(e: u32) -> TransferError {
 
 fn errno_to_transfer_error(e: Errno) -> TransferError {
     match e {
+        Errno::CANCELED => TransferError::Cancelled,
         Errno::NODEV | Errno::SHUTDOWN => TransferError::Disconnected,
         Errno::PIPE => TransferError::Stall,
         Errno::NOENT | Errno::CONNRESET | Errno::TIMEDOUT => TransferError::Cancelled,

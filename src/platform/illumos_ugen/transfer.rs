@@ -8,6 +8,7 @@ use rustix::io;
 use rustix::io::Errno;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::{Duration, Instant};
 
 // We have two possible cases for transfer errors: the raw read/write
 // failed OR the read/write succeded and the stat fd returned an error.
@@ -370,6 +371,8 @@ enum InternalDir {
 const USB_LC_STAT_UNSPECIFIED_ERR: u32 = 0xe;
 
 extern "C" fn aio_callback(arg: libc::sigval) {
+    // TODO(AJM): Review against https://github.com/libusb/libusb/blob/9c581bc6448ed3078cd08bfa0d32a78f72c7a1b0/libusb/os/sunos_usb.c#L1167-L1203
+
     // SAFETY: aio callback will ONLY be called when Pending, and we can
     // always treat TransferData as shared while in the Pending state.
     let alias_ptr = arg.sival_ptr.cast::<TransferData>();
@@ -382,6 +385,22 @@ extern "C" fn aio_callback(arg: libc::sigval) {
         "aiocb freed before AIO callback executed!"
     );
 
+    let read_stat_fd = || {
+        let mut stat: [u8; 4] = [0; 4];
+        match io::read(
+            // SAFETY we expect the stat fd to still be alive at this point
+            // and we stored it explicitly
+            unsafe { BorrowedFd::borrow_raw(alias.raw_stat_fd) },
+            &mut stat,
+        ) {
+            Ok(4) => UsbResult::UgenStat(u32::from_le_bytes(stat)),
+            // man page example just returns the unspecified error
+            Ok(_) => UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR),
+            // Return this errno?
+            Err(errno) => UsbResult::Errno(errno),
+        }
+    };
+
     let status = match unsafe { libc::aio_error(aiocb_ptr) } {
         // The handling here is a mess because if `aio_error` is 0 this should
         // always return something non-zero. This means the unwrap should
@@ -390,25 +409,15 @@ extern "C" fn aio_callback(arg: libc::sigval) {
 
         // Once again, the ugen man page says to check this only if the return
         // is -1
-        -1 => {
-            let mut stat: [u8; 4] = [0; 4];
-            match io::read(
-                // SAFETY we expect the stat fd to still be alive at this point
-                // and we stored it explicitly
-                unsafe { BorrowedFd::borrow_raw(alias.raw_stat_fd) },
-                &mut stat,
-            ) {
-                Ok(4) => Err(UsbResult::UgenStat(u32::from_le_bytes(stat))),
-                // man page example just returns the unspecified error
-                Ok(_) => Err(UsbResult::UgenStat(USB_LC_STAT_UNSPECIFIED_ERR)),
-                // Return this errno?
-                Err(errno) => Err(UsbResult::Errno(errno)),
-            }
-        }
+        -1 => Err(read_stat_fd()),
 
         // Other includes ECANCELED, which would occur if the transfer had
         // been cancelled prior to execution
-        other => Err(UsbResult::Errno(Errno::from_raw_os_error(other))),
+        other => {
+            let err = read_stat_fd();
+            log::warn!("OOPS: aio_error said {other}, would have missed: {err:?}");
+            Err(err)
+        }
     };
 
     unsafe {
@@ -467,22 +476,22 @@ impl Pending<TransferData> {
                 log::trace!("Successfully cancelled transfer");
             }
             libc::AIO_ALLDONE => {
-                // Okay, this is not great. Our atomic pointer WASN'T Null, but ALSO the
-                // callback wasn't marked as cancelled. Do one quick check JUST IN CASE
-                // there was a race between `aiocb.load` and `aio_cancel`. If the pointer
-                // is NOW null, we just observed a little race, and we can avoid any further
-                // remediation
-                let aiocb_ptr2 = alias.aiocb.load(Ordering::Acquire);
-                if aiocb_ptr2.is_null() {
-                    // Whew. Just a little race. The callback already handled cleanup.
-                    return;
-                }
+                log::warn!("OOPS: AIO_ALLDONE observed non-null aiocb_ptr, now spinning...");
+                let start = Instant::now();
+                loop {
+                    let aiocb_ptr = alias.aiocb.load(Ordering::Acquire);
+                    if aiocb_ptr.is_null() {
+                        break;
+                    }
 
-                // Now we are in the Cool Zone. The transfer is ALLDONE according to the
-                // operating system, but the callback DIDN'T clear the aiocb buffer.
-                // Something has gone seriously wrong, and let's not continue out of
-                // an abundance of caution
-                panic!("Indeterminate outcome reached on cancelling a transfer. This is a program error.");
+                    if start.elapsed() >= Duration::from_secs(30) {
+                        panic!("OOPS: Giving up on cancellation after 30s.");
+                    }
+
+                    // Be slightly nicer than a hard busy-loop when waiting for the AIO to
+                    // complete.
+                    std::thread::yield_now();
+                }
             }
             libc::AIO_NOTCANCELED => {
                 // According to the man page: "At least one of the requests specified was not canceled

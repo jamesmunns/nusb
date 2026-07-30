@@ -240,7 +240,7 @@ pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> 
 
     // We don't actually know the max length but this is a reasonable estimate that
     // other parts of nusb use
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 255];
     let cnt =
         io::read(fd, &mut buf).map_err(|e| Error::new_os(ErrorKind::Other, "failed to read", e))?;
 
@@ -249,7 +249,12 @@ pub(crate) fn get_raw_string(fd: &OwnedFd, index: u8) -> Result<Vec<u8>, Error> 
         return Err(Error::new(ErrorKind::Other, "empty string descriptor"));
     }
 
-    buf.truncate(buf[0].into());
+    let buflen = buf[0].into();
+    let len = cnt.min(buflen);
+    if buflen != len {
+        log::warn!("OOPS: truncating to {len} instead of {buflen}");
+    }
+    buf.truncate(len);
     Ok(buf)
 }
 
@@ -389,23 +394,30 @@ fn handle_errno_result(
 ) -> Result<usize, TransferError> {
     const USB_LC_STAT_UNSPECIFIED_ERR: u32 = 0xe;
 
-    let Err(errno) = status else {
-        return status.map_err(|e| errno_to_transfer_error(e));
-    };
-    // The exact wording is that if the return value is -1 we should check the
-    // stat fd
-    if errno.raw_os_error() == -1 {
+    let read_stat_fd = || {
         let mut stat: [u8; 4] = [0; 4];
         match io::read(stat_fd, &mut stat) {
-            Ok(4) => Err(ugen_to_transfer_error(u32::from_le_bytes(stat))),
+            Ok(4) => ugen_to_transfer_error(u32::from_le_bytes(stat)),
             // man page example just returns the unspecified error
-            Ok(_) => Err(ugen_to_transfer_error(USB_LC_STAT_UNSPECIFIED_ERR)),
-            Err(errno) => Err(errno_to_transfer_error(errno)),
+            Ok(_) => ugen_to_transfer_error(USB_LC_STAT_UNSPECIFIED_ERR),
+            Err(errno) => errno_to_transfer_error(errno),
         }
+    };
+
+    let errno = match status {
+        Ok(n) => return Ok(n),
+        Err(e) => e,
+    };
+
+    // The exact wording is that if the return value is -1 we should check the
+    // stat fd
+    let raw_os_err = errno.raw_os_error();
+    if raw_os_err == -1 {
+        Err(read_stat_fd())
     } else {
-        // Some other error dealing with the reading/writing. Treat this
-        // a a standard errno
-        status.map_err(|e| errno_to_transfer_error(e))
+        let err = read_stat_fd();
+        log::warn!("OOPS: handle_errno_result said {raw_os_err}, would have missed: {err:?}");
+        Err(err)
     }
 }
 
@@ -416,7 +428,12 @@ struct InternalFds {
 
 impl InternalFds {
     fn control_out(&mut self, out_buffer: Vec<u8>) -> Result<(), TransferError> {
-        handle_errno_result(io::write(&self.device_fd, &out_buffer), &self.stat_fd).map(|_| ())
+        handle_errno_result(io::write(&self.device_fd, &out_buffer), &self.stat_fd).map(|written| {
+            let total = out_buffer.len();
+            if written != total {
+                log::warn!("OOPS: control_out ignored writing {written} instead of {total}");
+            }
+        })
     }
 
     fn control_in(&mut self, out_buffer: Vec<u8>, length: usize) -> Result<Vec<u8>, TransferError> {
@@ -480,10 +497,13 @@ impl IllumosDevice {
                 DeviceDescriptor::new(&get_dev_descriptor(&device_fd, DescriptorType::Device, 0)?)
                     .ok_or(Error::new(ErrorKind::Other, "Invalid device descriptor"))?;
             let active_config = get_configuration(&device_fd)?;
+            if active_config != 0 {
+                log::warn!("OOPS: would have gotten configuration 0 instead of {active_config}");
+            }
 
             #[rustfmt::skip]
             let config_descriptors = get_cfg_descriptors(
-                &device_fd, DescriptorType::Configuration { index: 0 }, 0
+                &device_fd, DescriptorType::Configuration { index: active_config }, 0
             )?;
 
             let c = ConfigurationDescriptor::new(&config_descriptors)
